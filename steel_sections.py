@@ -77,34 +77,62 @@ def calc_sls_deflection(w_kNm: float, L_m: float, Iy_cm4: float, E_GPa: float = 
 
     return round(delta_max_mm, 2), round(delta_lim_mm, 2), round(util_def, 4)
 
-def size_member(M_u_kNm: float, P_u_kN: float, L_m: float = 3.5, w_kNm: float = 0.0, yield_strength_MPa: float = 275.0, section_type: str = None):
+def size_member(
+    M_u_kNm: float,
+    P_u_kN: float,
+    L_m: float = 6.0,
+    delta_max_mm: float = None,
+    yield_strength_MPa: float = 275.0,
+    member_type: str = "beam",
+    **kwargs
+):
     """
     Finds the lightest compliant Eurocode 3 section where:
     - Cross-section moment capacity utilization M_u / M_Rd <= 1.0
     - Axial compression capacity utilization P_u / N_Rd <= 1.0
     - Flexural Column Buckling utilization P_u / N_b_Rd <= 1.0
-    - SLS Deflection utilization delta_max / (L/360) <= 1.0
+    - SLS Deflection utilization delta_max / (L / 360) <= 1.0
     - Combined interaction P_u / N_b_Rd + M_u / M_Rd <= 1.0
 
-    Returns:
-    - Dict with optimal section details, capacities, buckling resistance, and utilization percentage.
+    Handles any additional keyword arguments (e.g. section_type, w_kNm) via **kwargs.
     """
     M_u = abs(M_u_kNm)
     P_u = abs(P_u_kN)
     f_y = float(yield_strength_MPa)
 
+    # Determine section_type ('UB' or 'UC')
+    sec_type_filter = kwargs.get("section_type", None)
+    if not sec_type_filter and member_type:
+        m_str = str(member_type).lower()
+        if "beam" in m_str or m_str == "ub":
+            sec_type_filter = "UB"
+        elif "col" in m_str or m_str == "uc":
+            sec_type_filter = "UC"
+
     candidates = STEEL_SECTIONS
-    if section_type:
-        candidates = [s for s in candidates if s["type"].upper() == section_type.upper()]
+    if sec_type_filter:
+        candidates = [s for s in candidates if s["type"].upper() == sec_type_filter.upper()]
 
     candidates = sorted(candidates, key=lambda x: x["mass"])
+
+    delta_limit = (L_m * 1000.0) / 360.0
 
     for sec in candidates:
         M_Rd = sec["W_pl_y"] * f_y * 1.0e-3
         N_Rd = sec["A"] * f_y * 1.0e-1
 
         N_b_Rd, chi = calc_ec3_buckling_resistance(sec["A"], sec["I_y"], sec["I_z"], L_m, f_y)
-        delta_max_mm, delta_lim_mm, util_def = calc_sls_deflection(w_kNm, L_m, sec["I_y"])
+
+        if delta_max_mm is not None:
+            d_max = float(delta_max_mm)
+            d_lim = delta_limit
+            util_def = d_max / d_lim if d_lim > 0 else 0.0
+        elif "w_kNm" in kwargs and kwargs["w_kNm"] > 0:
+            d_max, d_lim, util_def = calc_sls_deflection(kwargs["w_kNm"], L_m, sec["I_y"])
+        else:
+            d_max = 0.0
+            d_lim = delta_limit
+            util_def = 0.0
 
         util_M = M_u / M_Rd if M_Rd > 0 else 999.0
         util_N = P_u / N_Rd if N_Rd > 0 else 999.0
@@ -123,8 +151,8 @@ def size_member(M_u_kNm: float, P_u_kN: float, L_m: float = 3.5, w_kNm: float = 
                 "N_Rd_kN": round(N_Rd, 2),
                 "N_b_Rd_kN": round(N_b_Rd, 2),
                 "chi_buckling": round(chi, 4),
-                "delta_max_mm": round(delta_max_mm, 2),
-                "delta_lim_mm": round(delta_lim_mm, 2),
+                "delta_max_mm": round(d_max, 2),
+                "delta_lim_mm": round(d_lim, 2),
                 "util_M": round(util_M, 4),
                 "util_N": round(util_N, 4),
                 "util_buck": round(util_buck, 4),
@@ -133,12 +161,23 @@ def size_member(M_u_kNm: float, P_u_kN: float, L_m: float = 3.5, w_kNm: float = 
                 "util_pct": round(util_comb * 100, 2)
             }
 
-    # Fallback to largest section
+    # Fallback to largest available section
     largest = candidates[-1]
     M_Rd = largest["W_pl_y"] * f_y * 1.0e-3
     N_Rd = largest["A"] * f_y * 1.0e-1
     N_b_Rd, chi = calc_ec3_buckling_resistance(largest["A"], largest["I_y"], largest["I_z"], L_m, f_y)
-    delta_max_mm, delta_lim_mm, util_def = calc_sls_deflection(w_kNm, L_m, largest["I_y"])
+
+    if delta_max_mm is not None:
+        d_max = float(delta_max_mm)
+        d_lim = delta_limit
+        util_def = d_max / d_lim if d_lim > 0 else 0.0
+    elif "w_kNm" in kwargs and kwargs["w_kNm"] > 0:
+        d_max, d_lim, util_def = calc_sls_deflection(kwargs["w_kNm"], L_m, largest["I_y"])
+    else:
+        d_max = 0.0
+        d_lim = delta_limit
+        util_def = 0.0
+
     util_comb = max((M_u / M_Rd) + (P_u / N_b_Rd), util_def)
 
     return {
@@ -151,8 +190,8 @@ def size_member(M_u_kNm: float, P_u_kN: float, L_m: float = 3.5, w_kNm: float = 
         "N_Rd_kN": round(N_Rd, 2),
         "N_b_Rd_kN": round(N_b_Rd, 2),
         "chi_buckling": round(chi, 4),
-        "delta_max_mm": round(delta_max_mm, 2),
-        "delta_lim_mm": round(delta_lim_mm, 2),
+        "delta_max_mm": round(d_max, 2),
+        "delta_lim_mm": round(d_lim, 2),
         "util_M": round(M_u / M_Rd, 4),
         "util_N": round(P_u / N_Rd, 4),
         "util_buck": round(P_u / N_b_Rd, 4),
