@@ -6,4 +6,9 @@ pandas
 scikit-learn
 joblib
 fpdf2
+fastapi
+uvicorn
+requests
+pydantic
+
 

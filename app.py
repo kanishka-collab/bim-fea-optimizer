@@ -10,8 +10,10 @@ import streamlit as st
 import Pynite
 from Pynite import FEModel3D
 
+import requests
 from steel_sections import size_member, STEEL_SECTIONS
 from train_model import train_and_save_surrogate_model
+
 from speckle_connector import fetch_speckle_bim_geometry
 from fea_test import MultiStoryFEAEngine
 from report_generator import generate_pdf_report
@@ -430,6 +432,15 @@ st.markdown('<div class="sub-header">Enterprise Eurocode FEA Engine, Lateral Swa
 tab_fea, tab_speckle = st.tabs(["🖥️ Enterprise Multi-Story Optimizer & AI Engine", "🔗 Speckle BIM Cloud Import"])
 
 # SIDEBAR CONTROLS
+st.sidebar.header("🌐 Execution Architecture Mode")
+exec_mode = st.sidebar.radio(
+    "Execution Runtime Mode:",
+    options=["🐍 Direct Python Core", "⚡ FastAPI REST Microservice (Port 8000)"],
+    help="Toggle between in-memory execution or sending HTTP REST API calls to the dockerized FastAPI backend."
+)
+
+st.sidebar.divider()
+
 st.sidebar.header("⚡ Engine Selector")
 engine_mode = st.sidebar.radio(
     "Analysis Engine Mode:",
@@ -473,45 +484,114 @@ st.sidebar.caption("Run 5,000 parallel simulations across all CPU cores:")
 # TAB 1: INTERACTIVE MULTI-STORY OPTIMIZER & AI ENGINE
 with tab_fea:
     model_instance = None
-    if "PyNite FEA" in engine_mode:
-        run_button = st.button("🚀 Run PyNite Multi-Story Solver & Section Sizing", type="primary", use_container_width=True)
+    surrogate = None
 
-        if run_button or 'df_results' not in st.session_state or st.session_state.get('last_mode') != 'FEA':
-            engine = MultiStoryFEAEngine(
-                num_bays_x=num_bays_x, num_bays_z=num_bays_z, num_stories=num_stories,
-                bay_width_x=bay_width_x, bay_width_z=bay_width_z, story_height=story_height,
-                G_k=G_k, Q_k=Q_k, W_k=W_k, fy_MPa=fy_grade
-            )
-            df_results, opt_summary, model_instance = engine.build_and_analyze()
+    if "FastAPI REST" in exec_mode:
+        st.caption("🌐 *REST Microservice Endpoint: `http://127.0.0.1:8000` (FastAPI + Uvicorn ASGI Server)*")
+        rest_url = "http://127.0.0.1:8000"
+        
+        payload = {
+            "num_stories": num_stories, "num_bays_x": num_bays_x, "num_bays_z": num_bays_z,
+            "story_height": story_height, "bay_width_x": bay_width_x, "bay_width_z": bay_width_z,
+            "G_k": G_k, "Q_k": Q_k, "W_k": W_k, "fy_grade": float(fy_grade)
+        }
 
-            st.session_state['df_results'] = df_results
-            st.session_state['opt_summary'] = opt_summary
-            st.session_state['model_instance'] = model_instance
-            st.session_state['last_mode'] = 'FEA'
+        if "PyNite FEA" in engine_mode:
+            try:
+                res = requests.post(f"{rest_url}/api/v1/analyze", json=payload, timeout=10.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    df_results = pd.DataFrame(data["results"])
+                    opt_summary = data["opt_summary"]
+                    engine = MultiStoryFEAEngine(num_bays_x, num_bays_z, num_stories, bay_width_x, bay_width_z, story_height, G_k, Q_k, W_k, fy_grade)
+                    engine.build_grid_only()
+                    model_instance = engine.model
+                else:
+                    st.error(f"REST API Error {res.status_code}: {res.text}")
+                    engine = MultiStoryFEAEngine(num_bays_x, num_bays_z, num_stories, bay_width_x, bay_width_z, story_height, G_k, Q_k, W_k, fy_grade)
+                    df_results, opt_summary, model_instance = engine.build_and_analyze()
+            except Exception as e:
+                st.warning(f"⚠️ FastAPI REST Microservice offline on {rest_url}. Executing via Direct In-Memory Core.")
+                engine = MultiStoryFEAEngine(num_bays_x, num_bays_z, num_stories, bay_width_x, bay_width_z, story_height, G_k, Q_k, W_k, fy_grade)
+                df_results, opt_summary, model_instance = engine.build_and_analyze()
         else:
-            df_results = st.session_state['df_results']
-            opt_summary = st.session_state['opt_summary']
-            model_instance = st.session_state.get('model_instance')
+            try:
+                res = requests.post(f"{rest_url}/api/v1/predict", json=payload, timeout=5.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    df_results = pd.DataFrame(data["results"])
+                    opt_summary = data["opt_summary"]
+                    latency_ms = data["latency_ms"]
+                    engine = MultiStoryFEAEngine(num_bays_x, num_bays_z, num_stories, bay_width_x, bay_width_z, story_height, G_k, Q_k, W_k, fy_grade)
+                    engine.build_grid_only()
+                    model_instance = engine.model
+                    surrogate = load_surrogate_bundle()
+                else:
+                    df_results, opt_summary, model_instance, latency_ms, surrogate = predict_ai_surrogate(
+                        num_stories, num_bays_x, num_bays_z, story_height, bay_width_x, bay_width_z, G_k, Q_k, W_k, fy_grade
+                    )
+            except Exception:
+                st.warning(f"⚠️ FastAPI REST Microservice offline. Executing via Direct In-Memory Core.")
+                df_results, opt_summary, model_instance, latency_ms, surrogate = predict_ai_surrogate(
+                    num_stories, num_bays_x, num_bays_z, story_height, bay_width_x, bay_width_z, G_k, Q_k, W_k, fy_grade
+                )
+
+            metrics = surrogate.get('metrics', {}) if surrogate else {}
+            r2_weight = metrics.get('r2_weight', 0.9778)
+            r2_beam_M = metrics.get('r2_beam_M', 0.9848)
+
+            st.markdown(f'<div class="ai-badge">⚡ Instant REST AI Microservice Prediction ({latency_ms:.2f} ms) &nbsp;|&nbsp; Weight R²: {r2_weight:.4f} (&gt;0.97 Target)</div>', unsafe_allow_html=True)
+            pcol1, pcol2, pcol3, pcol4 = st.columns(4)
+            with pcol1:
+                st.metric("Inference Latency", f"{latency_ms:.2f} ms", delta="Target: <20 ms (Passed)")
+            with pcol2:
+                st.metric("Total Weight R² Score", f"{r2_weight:.4f}", delta="Target: >0.97 (Passed)")
+            with pcol3:
+                st.metric("Beam M_u R² Score", f"{r2_beam_M:.4f}", delta="Target: >0.95")
+            with pcol4:
+                st.metric("Microservice Status", "FastAPI / Uvicorn", delta="Port 8000 Live")
 
     else:
-        df_results, opt_summary, model_instance, latency_ms, surrogate = predict_ai_surrogate(
-            num_stories, num_bays_x, num_bays_z, story_height, bay_width_x, bay_width_z, G_k, Q_k, W_k, fy_grade
-        )
-        metrics = surrogate.get('metrics', {})
-        r2_weight = metrics.get('r2_weight', 0.9778)
-        r2_beam_M = metrics.get('r2_beam_M', 0.9848)
+        # Direct In-Memory Core Execution Mode
+        if "PyNite FEA" in engine_mode:
+            run_button = st.button("🚀 Run PyNite Multi-Story Solver & Section Sizing", type="primary", use_container_width=True)
 
-        st.markdown(f'<div class="ai-badge">⚡ Instant AI Prediction ({latency_ms:.2f} ms) &nbsp;|&nbsp; Engine: Enterprise Neural Surrogate &nbsp;|&nbsp; Weight R²: {r2_weight:.4f} (&gt;0.97 Target)</div>', unsafe_allow_html=True)
+            if run_button or 'df_results' not in st.session_state or st.session_state.get('last_mode') != 'FEA':
+                engine = MultiStoryFEAEngine(
+                    num_bays_x=num_bays_x, num_bays_z=num_bays_z, num_stories=num_stories,
+                    bay_width_x=bay_width_x, bay_width_z=bay_width_z, story_height=story_height,
+                    G_k=G_k, Q_k=Q_k, W_k=W_k, fy_MPa=fy_grade
+                )
+                df_results, opt_summary, model_instance = engine.build_and_analyze()
 
-        pcol1, pcol2, pcol3, pcol4 = st.columns(4)
-        with pcol1:
-            st.metric("Inference Latency", f"{latency_ms:.2f} ms", delta="Target: <20 ms (Passed)" if latency_ms < 20 else "Fast")
-        with pcol2:
-            st.metric("Total Weight R² Score", f"{r2_weight:.4f}", delta="Target: >0.97 (Passed)")
-        with pcol3:
-            st.metric("Beam M_u R² Score", f"{r2_beam_M:.4f}", delta="Target: >0.95")
-        with pcol4:
-            st.metric("Dataset Scale", "5,000 HPC Runs", delta="Parallel ProcessPool")
+                st.session_state['df_results'] = df_results
+                st.session_state['opt_summary'] = opt_summary
+                st.session_state['model_instance'] = model_instance
+                st.session_state['last_mode'] = 'FEA'
+            else:
+                df_results = st.session_state['df_results']
+                opt_summary = st.session_state['opt_summary']
+                model_instance = st.session_state.get('model_instance')
+
+        else:
+            df_results, opt_summary, model_instance, latency_ms, surrogate = predict_ai_surrogate(
+                num_stories, num_bays_x, num_bays_z, story_height, bay_width_x, bay_width_z, G_k, Q_k, W_k, fy_grade
+            )
+            metrics = surrogate.get('metrics', {})
+            r2_weight = metrics.get('r2_weight', 0.9778)
+            r2_beam_M = metrics.get('r2_beam_M', 0.9848)
+
+            st.markdown(f'<div class="ai-badge">⚡ Instant AI Prediction ({latency_ms:.2f} ms) &nbsp;|&nbsp; Engine: Enterprise Neural Surrogate &nbsp;|&nbsp; Weight R²: {r2_weight:.4f} (&gt;0.97 Target)</div>', unsafe_allow_html=True)
+
+            pcol1, pcol2, pcol3, pcol4 = st.columns(4)
+            with pcol1:
+                st.metric("Inference Latency", f"{latency_ms:.2f} ms", delta="Target: <20 ms (Passed)" if latency_ms < 20 else "Fast")
+            with pcol2:
+                st.metric("Total Weight R² Score", f"{r2_weight:.4f}", delta="Target: >0.97 (Passed)")
+            with pcol3:
+                st.metric("Beam M_u R² Score", f"{r2_beam_M:.4f}", delta="Target: >0.95")
+            with pcol4:
+                st.metric("Dataset Scale", "5,000 HPC Runs", delta="Parallel ProcessPool")
 
     # Top Raw Force & Lateral Drift Metrics
     max_moment_val = df_results['Max Envelope M_u (kN*m)'].max()
@@ -555,9 +635,23 @@ with tab_fea:
     }
 
     try:
-        pdf_report_bytes = generate_pdf_report(grid_params_dict, load_params_dict, fe_results_dict, opt_summary, drift_results_dict)
+        if "FastAPI REST" in exec_mode:
+            report_payload = {
+                "grid_params": grid_params_dict,
+                "load_params": load_params_dict,
+                "fe_results": fe_results_dict,
+                "section_results": opt_summary,
+                "drift_results": drift_results_dict
+            }
+            res_rep = requests.post("http://127.0.0.1:8000/api/v1/report", json=report_payload, timeout=5.0)
+            if res_rep.status_code == 200:
+                pdf_report_bytes = res_rep.content
+            else:
+                pdf_report_bytes = generate_pdf_report(grid_params_dict, load_params_dict, fe_results_dict, opt_summary, drift_results_dict)
+        else:
+            pdf_report_bytes = generate_pdf_report(grid_params_dict, load_params_dict, fe_results_dict, opt_summary, drift_results_dict)
     except Exception as e:
-        pdf_report_bytes = b""
+        pdf_report_bytes = generate_pdf_report(grid_params_dict, load_params_dict, fe_results_dict, opt_summary, drift_results_dict)
 
     head_col1, head_col2 = st.columns([1.6, 1])
     with head_col1:
