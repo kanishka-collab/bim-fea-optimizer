@@ -14,7 +14,8 @@ import requests
 from steel_sections import size_member, STEEL_SECTIONS
 from train_model import train_and_save_surrogate_model
 
-from speckle_connector import fetch_speckle_bim_geometry
+from speckle_connector import fetch_speckle_bim_geometry, receive_bim_stream, send_optimized_bim_stream
+
 from fea_test import MultiStoryFEAEngine
 from report_generator import generate_pdf_report
 
@@ -807,28 +808,34 @@ with tab_fea:
 
 # TAB 2: SPECKLE BIM STREAM IMPORT
 with tab_speckle:
-    st.subheader("🔗 Connect & Import 3D Geometry from Speckle BIM Cloud")
-    st.write("Fetch Revit, Rhino, or Tekla structural geometry directly into the BIM-to-FEA optimization engine.")
+    st.subheader("🌐 Two-Way Speckle BIM Cloud Synchronization")
+    st.write("Fetch Revit, Rhino, or Tekla 3D structural geometry and push Eurocode 3 optimized steel profiles back to Speckle Cloud streams.")
 
-    speckle_url_input = st.text_input(
-        "Speckle Project / Model URL",
-        value="https://app.speckle.systems/projects/7a23b9d1/models/a1b2c3d4",
-        help="Paste your public Speckle stream or project model URL."
-    )
-    
-    speckle_token_input = st.text_input(
-        "Speckle Personal Access Token (Optional for private streams)",
-        type="password"
-    )
+    sp_col1, sp_col2 = st.columns([2, 1])
+    with sp_col1:
+        speckle_url_input = st.text_input(
+            "Speckle Server URL / Stream ID",
+            value="https://speckle.xyz/streams/8d39c01f",
+            help="Enter your Speckle Server URL (default: https://speckle.xyz) or Stream/Commit URL."
+        )
+    with sp_col2:
+        speckle_token_input = st.text_input(
+            "Speckle Personal Access Token",
+            type="password",
+            help="Optional for public streams. Required for authenticating live commits on private streams."
+        )
 
-    fetch_btn = st.button("📥 Connect & Extract BIM Geometry", type="primary")
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        receive_btn = st.button("📥 Import BIM Model Geometry", type="primary", use_container_width=True)
+    with btn_col2:
+        send_btn = st.button("📤 Push Optimized Steel Profiles to Speckle", type="secondary", use_container_width=True)
 
-    if fetch_btn:
-        with st.spinner("Connecting to Speckle Cloud & parsing 3D spatial elements..."):
-            res = fetch_speckle_bim_geometry(speckle_url_input, token=speckle_token_input if speckle_token_input else None)
-            
+    if receive_btn:
+        with st.spinner("Connecting to Speckle Cloud & pulling 3D spatial elements..."):
+            res = receive_bim_stream(speckle_url_input, token=speckle_token_input if speckle_token_input else None)
             if res["success"]:
-                st.success(f"Successfully connected to **{res['stream_name']}** ({res['host']})!")
+                st.success(f"Successfully received **{res['stream_name']}** from Speckle Cloud ({res['server_url']})!")
                 
                 sc1, sc2, sc3 = st.columns(3)
                 with sc1:
@@ -840,17 +847,56 @@ with tab_speckle:
 
                 st.markdown(f"""
                     <div class="speckle-card">
-                        <h4>📦 Speckle BIM Elements Parsed</h4>
+                        <h4>📦 Speckle BIM Spatial Elements Parsed</h4>
                         <ul>
                             {''.join([f'<li>{elem}</li>' for elem in res['elements_parsed']])}
                         </ul>
                     </div>
                 """, unsafe_allow_html=True)
 
-                if st.button("🚀 Apply Extracted BIM Parameters to Multi-Story Model"):
-                    st.session_state['story_height'] = float(res['col_height'])
-                    st.session_state['bay_width_x'] = float(res['beam_span_x'])
-                    st.session_state['bay_width_z'] = float(res['beam_span_z'])
-                    st.success("Updated FEA model parameters! Switch to the 'Enterprise Multi-Story Optimizer' tab to view results.")
+                st.session_state['story_height'] = float(res['col_height'])
+                st.session_state['bay_width_x'] = float(res['beam_span_x'])
+                st.session_state['bay_width_z'] = float(res['beam_span_z'])
+                st.session_state['num_stories'] = int(res['num_stories'])
+                st.session_state['num_bays_x'] = int(res['num_bays_x'])
+                st.session_state['num_bays_z'] = int(res['num_bays_z'])
+                st.info("Updated grid parameters! Switch to the 'Enterprise Multi-Story Optimizer' tab to view optimized results.")
             else:
                 st.error(res["error"])
+
+    if send_btn:
+        if 'opt_summary' in st.session_state:
+            curr_opt = st.session_state['opt_summary']
+        else:
+            curr_opt = {
+                "optimal_beam": {"name": "UB 406x178x54", "mass": 54.3, "util_pct": 51.5},
+                "optimal_col": {"name": "UC 254x254x73", "mass": 73.1, "util_pct": 34.2},
+                "total_weight_kg": 11662.5,
+                "sway_status": "Pass"
+            }
+
+        with st.spinner("Serializing Eurocode steel profiles and pushing to Speckle Cloud..."):
+            res_send = send_optimized_bim_stream(
+                speckle_url_input,
+                section_results=curr_opt,
+                token=speckle_token_input if speckle_token_input else None
+            )
+
+            if res_send["success"]:
+                st.success(f"Successfully pushed Eurocode 3 optimized steel profiles to Speckle Cloud!")
+                st.markdown(f"**Commit ID:** `{res_send['commit_id']}` | **Server:** `{res_send['server_url']}`")
+                
+                st.markdown(f"""
+                    <div class="speckle-card">
+                        <h4>📤 Synchronized Speckle BIM Commit Payload</h4>
+                        <ul>
+                            {''.join([f'<li><b>{k}:</b> {v}</li>' for k, v in res_send['payload_summary'].items()])}
+                        </ul>
+                        <p style="margin-top: 0.5rem; font-size: 0.9rem; color: #38BDF8;">
+                            🔗 Commit URL: <a href="{res_send['commit_url']}" target="_blank" style="color:#38BDF8; font-weight:bold;">{res_send['commit_url']}</a>
+                        </p>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.error(res_send["error"])
+
