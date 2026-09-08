@@ -15,6 +15,12 @@ ENV/
 .streamlit/
 *.log
 
+# Heavy binaries & dataset caches (Auto-generated on startup)
+surrogate_model.pkl
+enterprise_fea_dataset.csv
+test_100.csv
+
 # OS generated files
 .DS_Store
 Thumbs.db
+

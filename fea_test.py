@@ -1,6 +1,6 @@
 """
 Enterprise Multi-Story Multi-Bay Structural FEA Engine (PyNite FEA Kernel)
-Supports Eurocode EN 1990/EN 1993 Load Combinations, Flexural Buckling, and SLS Deflection Sizing.
+Supports Eurocode EN 1990/EN 1993 Load Combinations, Flexural Buckling, SLS Deflection, and Top-Story Lateral Sway Drift (delta_sway <= H/500).
 """
 
 import pandas as pd
@@ -36,6 +36,36 @@ class MultiStoryFEAEngine:
         self.model = FEModel3D()
         self.df_results = None
         self.opt_summary = None
+
+    def build_grid_only(self):
+        """Builds structural grid nodes and members without analyzing."""
+        model = self.model
+        E, G, nu, rho = 200e6, 77e6, 0.3, 78.5
+        model.add_material('Steel', E, G, nu, rho)
+        model.add_section('SteelSection', 0.01, 1e-4, 2e-4, 5e-6)
+
+        for k in range(self.num_stories + 1):
+            for i in range(self.num_bays_x + 1):
+                for j in range(self.num_bays_z + 1):
+                    node_name = f"N_{i}_{k}_{j}"
+                    model.add_node(node_name, i * self.bay_width_x, k * self.story_height, j * self.bay_width_z)
+                    if k == 0:
+                        model.def_support(node_name, True, True, True, False, False, False)
+
+        for k in range(self.num_stories):
+            for i in range(self.num_bays_x + 1):
+                for j in range(self.num_bays_z + 1):
+                    model.add_member(f"C_{i}_{k}_{j}", f"N_{i}_{k}_{j}", f"N_{i}_{k+1}_{j}", 'Steel', 'SteelSection')
+
+        for k in range(1, self.num_stories + 1):
+            for i in range(self.num_bays_x):
+                for j in range(self.num_bays_z + 1):
+                    model.add_member(f"BX_{i}_{k}_{j}", f"N_{i}_{k}_{j}", f"N_{i+1}_{k}_{j}", 'Steel', 'SteelSection')
+
+        for k in range(1, self.num_stories + 1):
+            for i in range(self.num_bays_x + 1):
+                for j in range(self.num_bays_z):
+                    model.add_member(f"BZ_{i}_{k}_{j}", f"N_{i}_{k}_{j}", f"N_{i}_{k}_{j+1}", 'Steel', 'SteelSection')
 
     def build_and_analyze(self):
         """Builds multi-story structural grid model, applies Eurocode load combinations, and solves."""
@@ -120,7 +150,25 @@ class MultiStoryFEAEngine:
         # 8. Execute Solver
         model.analyze(log=False)
 
-        # 9. Extract Member Forces & Optimal Eurocode 3 Sizing
+        # 9. Extract Top-Story Lateral Sway Drift (delta_sway <= H / 500)
+        top_k = self.num_stories
+        total_height_m = top_k * self.story_height
+        sway_limit_mm = (total_height_m * 1000.0) / 500.0
+
+        max_dx_m = 0.0
+        for i in range(self.num_bays_x + 1):
+            for j in range(self.num_bays_z + 1):
+                node_name = f"N_{i}_{top_k}_{j}"
+                if node_name in model.nodes:
+                    dx = abs(model.nodes[node_name].DX.get('LC_SLS', 0.0))
+                    if dx > max_dx_m:
+                        max_dx_m = dx
+
+        delta_sway_mm = max_dx_m * 1000.0
+        util_sway = delta_sway_mm / sway_limit_mm if sway_limit_mm > 0 else 0.0
+        sway_status = "Pass" if util_sway <= 1.0 else "Fail"
+
+        # 10. Extract Member Forces & Optimal Eurocode 3 Sizing
         results = []
         max_beam_M = 0.0
         max_col_P = 0.0
@@ -157,7 +205,7 @@ class MultiStoryFEAEngine:
             # Perform section sizing
             sec_type = 'UC' if mtype == 'Column' else 'UB'
             total_load_w = self.G_k + self.Q_k if mtype == 'Beam' else 0.0
-            opt_sec = size_member(max_m, max_p, L_m=L_m, w_kNm=total_load_w, yield_strength_MPa=self.fy_MPa, section_type=sec_type)
+            opt_sec = size_member(max_m, max_p, L_m=L_m, w_kNm=total_load_w, yield_strength_MPa=self.fy_MPa, member_type=mtype, section_type=sec_type)
 
             util_pct = opt_sec['util_pct']
             status_color = "Green" if util_pct < 70.0 else ("Yellow" if util_pct <= 100.0 else "Red")
@@ -180,8 +228,8 @@ class MultiStoryFEAEngine:
 
         # Global optimal sections
         total_w_kNm = self.G_k + self.Q_k
-        optimal_beam = size_member(max_beam_M, 0.0, L_m=self.bay_width_x, w_kNm=total_w_kNm, yield_strength_MPa=self.fy_MPa, section_type='UB')
-        optimal_col = size_member(max_col_M, max_col_P, L_m=self.story_height, yield_strength_MPa=self.fy_MPa, section_type='UC')
+        optimal_beam = size_member(max_beam_M, 0.0, L_m=self.bay_width_x, w_kNm=total_w_kNm, yield_strength_MPa=self.fy_MPa, member_type='beam', section_type='UB')
+        optimal_col = size_member(max_col_M, max_col_P, L_m=self.story_height, yield_strength_MPa=self.fy_MPa, member_type='column', section_type='UC')
 
         # Total Weight calculation
         total_col_length = (self.num_bays_x + 1) * (self.num_bays_z + 1) * self.num_stories * self.story_height
@@ -198,23 +246,28 @@ class MultiStoryFEAEngine:
             "max_beam_M": round(max_beam_M, 2),
             "max_col_P": round(max_col_P, 2),
             "total_nodes": len(model.nodes),
-            "total_members": len(model.members)
+            "total_members": len(model.members),
+            "total_height_m": round(total_height_m, 2),
+            "delta_sway_mm": round(delta_sway_mm, 2),
+            "delta_sway_lim_mm": round(sway_limit_mm, 2),
+            "util_sway": round(util_sway, 4),
+            "sway_status": sway_status
         }
 
         return df_results, self.opt_summary, model
 
 def main():
-    print("Executing Enterprise MultiStoryFEAEngine Test...")
+    print("Executing Enterprise MultiStoryFEAEngine Test with Lateral Sway Drift...")
     engine = MultiStoryFEAEngine(
         num_bays_x=2,
         num_bays_z=1,
-        num_stories=2,
+        num_stories=3,
         bay_width_x=6.0,
         bay_width_z=5.0,
         story_height=3.5,
         G_k=15.0,
         Q_k=10.0,
-        W_k=5.0
+        W_k=12.0
     )
     df, opt, model = engine.build_and_analyze()
 
@@ -222,11 +275,12 @@ def main():
     print("      ENTERPRISE MULTI-STORY STRUCTURAL FEA       ")
     print("==================================================")
     print(f"Total Nodes: {opt['total_nodes']} | Total Members: {opt['total_members']}")
+    print(f"Total Height: {opt['total_height_m']} m")
+    print(f"Top-Story Sway Drift: {opt['delta_sway_mm']} mm (Limit H/500 = {opt['delta_sway_lim_mm']} mm) -> Status: {opt['sway_status']}")
     print(f"Optimal Beam Section (UB) : {opt['optimal_beam']['name']} ({opt['optimal_beam']['mass']} kg/m)")
     print(f"Optimal Column Section (UC): {opt['optimal_col']['name']} ({opt['optimal_col']['mass']} kg/m)")
     print(f"Total Steel Weight         : {opt['total_weight_kg']:.2f} kg")
     print("==================================================\n")
-    print(df.head(10))
 
 if __name__ == '__main__':
     main()

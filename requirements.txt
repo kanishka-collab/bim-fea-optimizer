@@ -5,3 +5,5 @@ plotly
 pandas
 scikit-learn
 joblib
+fpdf2
+

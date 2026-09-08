@@ -39,24 +39,24 @@ def train_and_save_surrogate_model(csv_path="fea_dataset.csv", model_path="surro
     _, _, y_col_P_train, y_col_P_test = train_test_split(X, y_col_P, test_size=0.2, random_state=42)
 
     # Classifiers
-    clf_beam = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf_beam = RandomForestClassifier(n_estimators=30, random_state=42)
     clf_beam.fit(X_train, y_beam_sec_train)
     acc_beam = accuracy_score(y_beam_sec_test, clf_beam.predict(X_test))
 
-    clf_col = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf_col = RandomForestClassifier(n_estimators=30, random_state=42)
     clf_col.fit(X_train, y_col_sec_train)
     acc_col = accuracy_score(y_col_sec_test, clf_col.predict(X_test))
 
     # Regressors
-    reg_weight = RandomForestRegressor(n_estimators=100, random_state=42)
+    reg_weight = RandomForestRegressor(n_estimators=30, random_state=42)
     reg_weight.fit(X_train, y_weight_train)
     r2_weight = r2_score(y_weight_test, reg_weight.predict(X_test))
 
-    reg_beam_M = RandomForestRegressor(n_estimators=100, random_state=42)
+    reg_beam_M = RandomForestRegressor(n_estimators=30, random_state=42)
     reg_beam_M.fit(X_train, y_beam_M_train)
     r2_beam_M = r2_score(y_beam_M_test, reg_beam_M.predict(X_test))
 
-    reg_col_P = RandomForestRegressor(n_estimators=100, random_state=42)
+    reg_col_P = RandomForestRegressor(n_estimators=30, random_state=42)
     reg_col_P.fit(X_train, y_col_P_train)
     r2_col_P = r2_score(y_col_P_test, reg_col_P.predict(X_test))
 
