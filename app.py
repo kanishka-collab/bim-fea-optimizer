@@ -13,6 +13,7 @@ from Pynite import FEModel3D
 from steel_sections import size_member, STEEL_SECTIONS
 from train_model import train_and_save_surrogate_model
 from speckle_connector import fetch_speckle_bim_geometry
+from fea_test import MultiStoryFEAEngine
 
 # Page setup with modern wide layout and custom title
 st.set_page_config(
@@ -22,20 +23,20 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS styling
+# Custom CSS styling for premium look
 st.markdown("""
     <style>
     .main-header {
         font-size: 2.3rem;
         font-weight: 700;
-        background: linear-gradient(90deg, #4A90E2, #50E3C2);
+        background: linear-gradient(90deg, #38BDF8, #34D399);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         margin-bottom: 0.3rem;
     }
     .sub-header {
         font-size: 1.05rem;
-        color: #8898AA;
+        color: #94A3B8;
         margin-bottom: 1.6rem;
     }
     .opt-card {
@@ -80,137 +81,179 @@ st.markdown("""
         padding: 1.2rem;
         margin-top: 1rem;
     }
+    .legend-box {
+        background: #0F172A;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 0.5rem 1rem;
+        margin-bottom: 0.5rem;
+        display: flex;
+        gap: 1.5rem;
+        align-items: center;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize Session State Defaults for parameters
-if 'col_height' not in st.session_state:
-    st.session_state['col_height'] = 3.5
-if 'beam_span_x' not in st.session_state:
-    st.session_state['beam_span_x'] = 6.0
-if 'beam_span_z' not in st.session_state:
-    st.session_state['beam_span_z'] = 6.0
+# Session state defaults
+if 'num_stories' not in st.session_state:
+    st.session_state['num_stories'] = 2
+if 'num_bays_x' not in st.session_state:
+    st.session_state['num_bays_x'] = 2
+if 'num_bays_z' not in st.session_state:
+    st.session_state['num_bays_z'] = 1
+if 'bay_width_x' not in st.session_state:
+    st.session_state['bay_width_x'] = 6.0
+if 'bay_width_z' not in st.session_state:
+    st.session_state['bay_width_z'] = 5.0
+if 'story_height' not in st.session_state:
+    st.session_state['story_height'] = 3.5
 
-def build_and_analyze_model(col_height, beam_span_x, beam_span_z, point_load_top, dist_load_beam, fy_MPa=275.0):
-    """Builds PyNite 3D portal frame model, analyzes, and performs structural optimization."""
-    model = FEModel3D()
+def plot_3d_frame(model, df_results):
+    """
+    Renders an interactive Plotly 3D visualizer of full multi-story, multi-bay grid
+    with member utilization stress heatmaps (Green = <70%, Yellow = 70-95%, Red = >100%).
+    """
+    fig = go.Figure()
 
-    # Material: Steel (E = 200 GPa, G = 77 GPa, nu = 0.3, rho = 78.5 kN/m^3)
-    E = 200e6    # kN/m^2
-    G = 77e6     # kN/m^2
-    nu = 0.3
-    rho = 78.5   # kN/m^3
-    model.add_material('Steel', E, G, nu, rho)
+    if model is None or df_results is None or len(df_results) == 0:
+        return fig
 
-    # Section properties
-    A = 0.01      # m^2
-    Iz = 2.0e-4   # m^4
-    Iy = 1.0e-4   # m^4
-    J = 5.0e-6    # m^4
-    model.add_section('SteelSection', A, Iy, Iz, J)
-
-    # Base nodes (Y = 0.0 m)
-    model.add_node('N1', 0.0, 0.0, 0.0)
-    model.add_node('N2', beam_span_x, 0.0, 0.0)
-    model.add_node('N3', beam_span_x, 0.0, beam_span_z)
-    model.add_node('N4', 0.0, 0.0, beam_span_z)
-
-    # Top nodes (Y = col_height m)
-    model.add_node('N5', 0.0, col_height, 0.0)
-    model.add_node('N6', beam_span_x, col_height, 0.0)
-    model.add_node('N7', beam_span_x, col_height, beam_span_z)
-    model.add_node('N8', 0.0, col_height, beam_span_z)
-
-    # Members
-    model.add_member('C1', 'N1', 'N5', 'Steel', 'SteelSection')
-    model.add_member('C2', 'N2', 'N6', 'Steel', 'SteelSection')
-    model.add_member('C3', 'N3', 'N7', 'Steel', 'SteelSection')
-    model.add_member('C4', 'N4', 'N8', 'Steel', 'SteelSection')
-
-    model.add_member('B1', 'N5', 'N6', 'Steel', 'SteelSection')
-    model.add_member('B2', 'N6', 'N7', 'Steel', 'SteelSection')
-    model.add_member('B3', 'N7', 'N8', 'Steel', 'SteelSection')
-    model.add_member('B4', 'N8', 'N5', 'Steel', 'SteelSection')
-
-    # Supports & Loads
-    for node in ['N1', 'N2', 'N3', 'N4']:
-        model.def_support(node, True, True, True, False, False, False)
-
-    for node in ['N5', 'N6', 'N7', 'N8']:
-        model.add_node_load(node, 'FY', -abs(point_load_top), case='D')
-
-    for beam in ['B1', 'B2', 'B3', 'B4']:
-        model.add_member_dist_load(beam, 'FY', -abs(dist_load_beam), -abs(dist_load_beam), case='D')
-
-    # Load Combo & Analysis
-    model.add_load_combo('LC1', {'D': 1.0})
-    model.analyze(log=False)
-
-    # Member Forces & Sizing
-    results = []
-    beam_m_max_all = 0.0
-    col_p_max_all = 0.0
-    col_m_max_all = 0.0
+    # Map member utilization to status colors
+    res_dict = df_results.set_index('Member').to_dict('index')
 
     for name, member in model.members.items():
-        mtype = "Column" if name.startswith('C') else "Beam"
-        
-        p_max = abs(member.max_axial('LC1'))
-        p_min = abs(member.min_axial('LC1'))
-        max_p = max(p_max, p_min)
+        n1 = member.i_node
+        n2 = member.j_node
+        info = res_dict.get(name, {})
+        util = info.get('Util (%)', 0.0)
 
-        mz_max = abs(member.max_moment('Mz', combo_tags='LC1'))
-        mz_min = abs(member.min_moment('Mz', combo_tags='LC1'))
-        my_max = abs(member.max_moment('My', combo_tags='LC1'))
-        my_min = abs(member.min_moment('My', combo_tags='LC1'))
-
-        max_m = max(mz_max, mz_min, my_max, my_min)
-        max_mz = max(mz_max, mz_min)
-        max_my = max(my_max, my_min)
-
-        if mtype == "Beam":
-            if max_m > beam_m_max_all:
-                beam_m_max_all = max_m
+        # Color Heatmap Mapping
+        if util < 70.0:
+            color = '#10B981'   # Green: Safe & Efficient
+            status_text = "Green (<70% Safe)"
+        elif util <= 100.0:
+            color = '#F59E0B'   # Yellow: High Utilization (70-100%)
+            status_text = "Yellow (70-100% Optimal)"
         else:
-            if max_p > col_p_max_all:
-                col_p_max_all = max_p
-            if max_m > col_m_max_all:
-                col_m_max_all = max_m
+            color = '#EF4444'   # Red: Overstressed (>100%)
+            status_text = "Red (>100% Overstressed)"
 
-        results.append({
-            "Member": name,
-            "Type": mtype,
-            "Length (m)": round(member.L(), 2),
-            "Axial Force P_u (kN)": round(max_p, 4),
-            "Max Bending M_z (kN*m)": round(max_mz, 4),
-            "Max Bending M_y (kN*m)": round(max_my, 4),
-            "Max Envelope M_u (kN*m)": round(max_m, 4),
-        })
+        width = 8 if name.startswith('C') else 5
 
-    df_results = pd.DataFrame(results)
+        hover_txt = (
+            f"<b>Member: {name}</b> ({info.get('Type', '')})<br>"
+            f"Section: <b>{info.get('Assigned Section', '')}</b><br>"
+            f"Length: {member.L():.2f} m<br>"
+            f"Axial Force P_u: {info.get('Axial Force P_u (kN)', 0.0):.2f} kN<br>"
+            f"Max Moment M_u: {info.get('Max Envelope M_u (kN*m)', 0.0):.2f} kN*m<br>"
+            f"<b>Utilization: {util:.1f}% ({status_text})</b>"
+        )
 
-    # Perform Steel Section Optimization
-    optimal_beam = size_member(beam_m_max_all, 0.0, yield_strength_MPa=fy_MPa, section_type='UB')
-    optimal_col = size_member(col_m_max_all, col_p_max_all, yield_strength_MPa=fy_MPa, section_type='UC')
+        fig.add_trace(go.Scatter3d(
+            x=[n1.X, n2.X],
+            y=[n1.Z, n2.Z],    # Swap Y & Z for vertical elevation (Z = height)
+            z=[n1.Y, n2.Y],
+            mode='lines+markers',
+            line=dict(color=color, width=width),
+            marker=dict(size=4, color=color),
+            name=f"{name} ({util:.0f}%)",
+            hoverinfo='text',
+            hovertext=hover_txt
+        ))
 
-    # Total Frame Steel Weight
-    total_col_length = 4.0 * col_height
-    total_beam_length = 2.0 * beam_span_x + 2.0 * beam_span_z
-    total_weight_kg = (total_col_length * optimal_col['mass']) + (total_beam_length * optimal_beam['mass'])
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='X Span (m)',
+            yaxis_title='Z Depth (m)',
+            zaxis_title='Y Elevation Height (m)',
+            aspectmode='data',
+            camera=dict(eye=dict(x=1.6, y=1.6, z=1.3))
+        ),
+        margin=dict(l=0, r=0, b=0, t=20),
+        height=520,
+        showlegend=False
+    )
+    return fig
 
-    opt_summary = {
-        "optimal_beam": optimal_beam,
-        "optimal_col": optimal_col,
-        "total_weight_kg": round(total_weight_kg, 2),
-        "beam_m_max": round(beam_m_max_all, 2),
-        "col_p_max": round(col_p_max_all, 2),
-        "col_m_max": round(col_m_max_all, 2)
-    }
+def plot_member_diagrams(model, member_name, combo_name='LC_ULS1'):
+    """Generates stacked Plotly diagrams (BMD, SFD, AFD) sampling 50 points along member length."""
+    if model is None or member_name not in model.members:
+        return None
 
-    return df_results, opt_summary, model
+    member = model.members[member_name]
+    L = member.L()
+    x_vals = np.linspace(0, L, 50)
 
-def predict_ai_surrogate(col_height, beam_span_x, beam_span_z, point_load_top, dist_load_beam, fy_MPa=275.0):
-    """Predicts structural frame forces and optimal section sizing instantly using Random Forest Surrogate Models."""
+    m_vals = []
+    v_vals = []
+    p_vals = []
+
+    for x in x_vals:
+        try:
+            m = member.moment('Mz', x, combo_name=combo_name)
+        except Exception:
+            m = 0.0
+        try:
+            v = member.shear('Fy', x, combo_name=combo_name)
+        except Exception:
+            v = 0.0
+        try:
+            p = member.axial(x, combo_name=combo_name)
+        except Exception:
+            p = 0.0
+
+        m_vals.append(m)
+        v_vals.append(v)
+        p_vals.append(p)
+
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=(
+            f"Bending Moment Diagram (BMD) - M_z (kN*m) | Member {member_name}",
+            f"Shear Force Diagram (SFD) - F_y (kN) | Member {member_name}",
+            f"Axial Force Diagram (AFD) - P (kN) | Member {member_name}"
+        )
+    )
+
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=m_vals, mode='lines', name='Mz',
+        line=dict(color='#EC4899', width=2.5), fill='tozeroy', fillcolor='rgba(236, 72, 153, 0.18)',
+        hovertemplate='x: %{x:.2f} m<br>Mz: %{y:.2f} kN*m'
+    ), row=1, col=1)
+    fig.add_hline(y=0, line_dash='dash', line_color='#64748B', row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=v_vals, mode='lines', name='Fy',
+        line=dict(color='#3B82F6', width=2.5), fill='tozeroy', fillcolor='rgba(59, 130, 246, 0.18)',
+        hovertemplate='x: %{x:.2f} m<br>Fy: %{y:.2f} kN'
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash='dash', line_color='#64748B', row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_vals, y=p_vals, mode='lines', name='P',
+        line=dict(color='#10B981', width=2.5), fill='tozeroy', fillcolor='rgba(16, 185, 129, 0.18)',
+        hovertemplate='x: %{x:.2f} m<br>P: %{y:.2f} kN'
+    ), row=3, col=1)
+    fig.add_hline(y=0, line_dash='dash', line_color='#64748B', row=3, col=1)
+
+    fig.update_xaxes(title_text="Member Distance x (m)", row=3, col=1)
+    fig.update_yaxes(title_text="Mz (kN*m)", row=1, col=1)
+    fig.update_yaxes(title_text="Fy (kN)", row=2, col=1)
+    fig.update_yaxes(title_text="P (kN)", row=3, col=1)
+
+    fig.update_layout(
+        height=600,
+        margin=dict(l=40, r=40, t=50, b=40),
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(15, 23, 42, 0.6)'
+    )
+    return fig
+
+def predict_ai_surrogate(num_stories, num_bays_x, num_bays_z, story_height, bay_width_x, bay_width_z, G_k, Q_k, W_k, fy_MPa=275.0):
+    """Predicts multi-story frame weight and optimal sections using AI surrogate models."""
     model_path = "surrogate_model.pkl"
     if not os.path.exists(model_path):
         train_and_save_surrogate_model("fea_dataset.csv", model_path)
@@ -218,13 +261,20 @@ def predict_ai_surrogate(col_height, beam_span_x, beam_span_z, point_load_top, d
     surrogate = joblib.load(model_path)
     start_t = time.time()
 
+    # Input features map
     X_input = pd.DataFrame([{
-        'H_m': col_height,
-        'Lx_m': beam_span_x,
-        'Lz_m': beam_span_z,
-        'point_load_P_kN': point_load_top,
-        'dist_load_w_kNm': dist_load_beam
+        'num_stories': num_stories, 'num_bays_x': num_bays_x, 'num_bays_z': num_bays_z,
+        'story_height': story_height, 'bay_width_x': bay_width_x, 'bay_width_z': bay_width_z,
+        'G_k': G_k, 'Q_k': Q_k, 'W_k': W_k,
+        'H_m': story_height * num_stories, 'Lx_m': bay_width_x * num_bays_x, 'Lz_m': bay_width_z * num_bays_z,
+        'point_load_P_kN': Q_k * 5.0, 'dist_load_w_kNm': G_k + Q_k
     }])
+
+    feat_cols = surrogate.get('feature_cols', X_input.columns.tolist())
+    for col in feat_cols:
+        if col not in X_input.columns:
+            X_input[col] = 0.0
+    X_input = X_input[feat_cols]
 
     pred_beam_sec = surrogate['clf_beam'].predict(X_input)[0]
     pred_col_sec = surrogate['clf_col'].predict(X_input)[0]
@@ -243,242 +293,88 @@ def predict_ai_surrogate(col_height, beam_span_x, beam_span_z, point_load_top, d
     beam_util = round((pred_beam_M / M_Rd_beam) * 100, 2)
     col_util = round((pred_col_P / N_Rd_col) * 100, 2)
 
-    optimal_beam = {
-        "name": pred_beam_sec,
-        "type": "UB",
-        "mass": beam_sec_info['mass'],
-        "util_pct": min(beam_util, 99.9)
-    }
-
-    optimal_col = {
-        "name": pred_col_sec,
-        "type": "UC",
-        "mass": col_sec_info['mass'],
-        "util_pct": min(col_util, 99.9)
-    }
-
     opt_summary = {
-        "optimal_beam": optimal_beam,
-        "optimal_col": optimal_col,
+        "optimal_beam": {"name": pred_beam_sec, "type": "UB", "mass": beam_sec_info['mass'], "util_pct": min(beam_util, 99.9)},
+        "optimal_col": {"name": pred_col_sec, "type": "UC", "mass": col_sec_info['mass'], "util_pct": min(col_util, 99.9)},
         "total_weight_kg": round(pred_weight, 2),
-        "beam_m_max": round(pred_beam_M, 2),
-        "col_p_max": round(pred_col_P, 2),
+        "max_beam_M": round(pred_beam_M, 2),
+        "max_col_P": round(pred_col_P, 2),
         "latency_ms": round(latency_ms, 2)
     }
 
+    # Generate synthetic results dataframe for AI mode
     results = []
-    for i in range(1, 5):
-        results.append({
-            "Member": f"C{i}",
-            "Type": "Column",
-            "Length (m)": round(col_height, 2),
-            "Axial Force P_u (kN)": round(pred_col_P, 4),
-            "Max Bending M_z (kN*m)": 0.0,
-            "Max Bending M_y (kN*m)": 0.0,
-            "Max Envelope M_u (kN*m)": 0.0
-        })
-    for i in range(1, 5):
-        results.append({
-            "Member": f"B{i}",
-            "Type": "Beam",
-            "Length (m)": round(beam_span_x if i in [1, 3] else beam_span_z, 2),
-            "Axial Force P_u (kN)": round(pred_col_P * 0.06, 4),
-            "Max Bending M_z (kN*m)": round(pred_beam_M, 4),
-            "Max Bending M_y (kN*m)": 0.0,
-            "Max Envelope M_u (kN*m)": round(pred_beam_M, 4)
-        })
+    for k in range(num_stories):
+        for i in range(num_bays_x + 1):
+            for j in range(num_bays_z + 1):
+                results.append({
+                    "Member": f"C_{i}_{k}_{j}", "Type": "Column", "Length (m)": story_height,
+                    "Axial Force P_u (kN)": round(pred_col_P, 2), "Max Bending M_z (kN*m)": 0.0,
+                    "Max Bending M_y (kN*m)": 0.0, "Max Envelope M_u (kN*m)": 0.0,
+                    "Assigned Section": pred_col_sec, "Mass (kg/m)": col_sec_info['mass'],
+                    "Util (%)": min(col_util, 99.9), "Status": "Green" if col_util < 70 else "Yellow"
+                })
+
+    for k in range(1, num_stories + 1):
+        for i in range(num_bays_x):
+            for j in range(num_bays_z + 1):
+                results.append({
+                    "Member": f"BX_{i}_{k}_{j}", "Type": "Beam", "Length (m)": bay_width_x,
+                    "Axial Force P_u (kN)": 0.0, "Max Bending M_z (kN*m)": round(pred_beam_M, 2),
+                    "Max Bending M_y (kN*m)": 0.0, "Max Envelope M_u (kN*m)": round(pred_beam_M, 2),
+                    "Assigned Section": pred_beam_sec, "Mass (kg/m)": beam_sec_info['mass'],
+                    "Util (%)": min(beam_util, 99.9), "Status": "Green" if beam_util < 70 else "Yellow"
+                })
 
     df_results = pd.DataFrame(results)
-    return df_results, opt_summary, latency_ms
 
-def plot_member_diagrams(model, member_name, combo_name='LC1', col_height=3.5, beam_span_x=6.0, beam_span_z=6.0, dist_load=15.0, point_load=50.0):
-    """
-    Generates stacked Plotly diagrams (BMD, SFD, AFD) for a selected member
-    by sampling 50 points along its length.
-    """
-    if model is not None and member_name in model.members:
-        member = model.members[member_name]
-        L = member.L()
-        x_vals = np.linspace(0, L, 50)
-
-        m_vals = []
-        v_vals = []
-        p_vals = []
-
-        for x in x_vals:
-            try:
-                m = member.moment('Mz', x, combo_name=combo_name)
-            except Exception:
-                m = 0.0
-            try:
-                v = member.shear('Fy', x, combo_name=combo_name)
-            except Exception:
-                v = 0.0
-            try:
-                p = member.axial(x, combo_name=combo_name)
-            except Exception:
-                p = 0.0
-
-            m_vals.append(m)
-            v_vals.append(v)
-            p_vals.append(p)
-
-    else:
-        # Synthetic force distribution profile for AI surrogate mode
-        L = col_height if member_name.startswith('C') else (beam_span_x if member_name in ['B1', 'B3'] else beam_span_z)
-        x_vals = np.linspace(0, L, 50)
-
-        if member_name.startswith('C'):
-            # Column: constant axial compression P_u, minor moment
-            p_vals = [- (point_load + dist_load * (beam_span_x + beam_span_z) / 2)] * 50
-            v_vals = [0.0] * 50
-            m_vals = [0.0] * 50
-        else:
-            # Beam: parabolic moment, linear shear, minor axial
-            w = dist_load
-            p_vals = [0.0] * 50
-            v_vals = [ (w * L / 2) - w * x for x in x_vals ]
-            m_vals = [ (w * x / 2) * (L - x) for x in x_vals ]
-
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.08,
-        subplot_titles=(
-            f"Bending Moment Diagram (BMD) - M_z (kN*m) | Member {member_name}",
-            f"Shear Force Diagram (SFD) - F_y (kN) | Member {member_name}",
-            f"Axial Force Diagram (AFD) - P (kN) | Member {member_name}"
-        )
-    )
-
-    # 1. BMD (Bending Moment Diagram)
-    fig.add_trace(go.Scatter(
-        x=x_vals, y=m_vals,
-        mode='lines',
-        name='Bending Moment (Mz)',
-        line=dict(color='#EC4899', width=2.5),
-        fill='tozeroy',
-        fillcolor='rgba(236, 72, 153, 0.18)',
-        hovertemplate='x: %{x:.2f} m<br>Mz: %{y:.2f} kN*m'
-    ), row=1, col=1)
-    fig.add_hline(y=0, line_dash='dash', line_color='#64748B', row=1, col=1)
-
-    # 2. SFD (Shear Force Diagram)
-    fig.add_trace(go.Scatter(
-        x=x_vals, y=v_vals,
-        mode='lines',
-        name='Shear Force (Fy)',
-        line=dict(color='#3B82F6', width=2.5),
-        fill='tozeroy',
-        fillcolor='rgba(59, 130, 246, 0.18)',
-        hovertemplate='x: %{x:.2f} m<br>Fy: %{y:.2f} kN'
-    ), row=2, col=1)
-    fig.add_hline(y=0, line_dash='dash', line_color='#64748B', row=2, col=1)
-
-    # 3. AFD (Axial Force Diagram)
-    fig.add_trace(go.Scatter(
-        x=x_vals, y=p_vals,
-        mode='lines',
-        name='Axial Force (P)',
-        line=dict(color='#10B981', width=2.5),
-        fill='tozeroy',
-        fillcolor='rgba(16, 185, 129, 0.18)',
-        hovertemplate='x: %{x:.2f} m<br>P: %{y:.2f} kN'
-    ), row=3, col=1)
-    fig.add_hline(y=0, line_dash='dash', line_color='#64748B', row=3, col=1)
-
-    fig.update_xaxes(title_text="Member Length x (m)", row=3, col=1)
-    fig.update_yaxes(title_text="Mz (kN*m)", row=1, col=1)
-    fig.update_yaxes(title_text="Fy (kN)", row=2, col=1)
-    fig.update_yaxes(title_text="P (kN)", row=3, col=1)
-
-    fig.update_layout(
-        height=600,
-        margin=dict(l=40, r=40, t=50, b=40),
-        showlegend=False,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(15, 23, 42, 0.6)'
-    )
-    return fig
+    # Build representative PyNite model instance for AI mode visualization
+    engine = MultiStoryFEAEngine(num_bays_x, num_bays_z, num_stories, bay_width_x, bay_width_z, story_height, G_k, Q_k, W_k, fy_MPa)
+    engine.build_grid_only()
+    
+    return df_results, opt_summary, engine.model, latency_ms
 
 def generate_dataset(num_runs=200):
-    """Generates synthetic dataset of random 3D portal frame configurations and optimal sections."""
+    """Generates multi-story multi-bay structural training dataset."""
     dataset = []
     random.seed(42)
-    progress_bar = st.progress(0, text="Generating ML Training Dataset (200 Runs)...")
+    progress_bar = st.progress(0, text="Generating Enterprise ML Training Dataset (200 Runs)...")
 
     for i in range(num_runs):
-        Lx = round(random.uniform(4.0, 10.0), 2)
-        Lz = round(random.uniform(4.0, 10.0), 2)
-        H = round(random.uniform(3.0, 5.0), 2)
-        w = round(random.uniform(10.0, 50.0), 2)
-        P = round(random.uniform(10.0, 100.0), 2)
+        n_stories = random.randint(1, 4)
+        n_bays_x = random.randint(1, 3)
+        n_bays_z = random.randint(1, 3)
 
-        model = FEModel3D()
-        model.add_material('Steel', 200e6, 77e6, 0.3, 78.5)
-        model.add_section('SteelSection', 0.01, 1e-4, 2e-4, 5e-6)
+        w_x = round(random.uniform(4.0, 9.0), 2)
+        w_z = round(random.uniform(4.0, 9.0), 2)
+        h = round(random.uniform(3.0, 4.5), 2)
 
-        model.add_node('N1', 0.0, 0.0, 0.0)
-        model.add_node('N2', Lx, 0.0, 0.0)
-        model.add_node('N3', Lx, 0.0, Lz)
-        model.add_node('N4', 0.0, 0.0, Lz)
+        G_k = round(random.uniform(5.0, 25.0), 2)
+        Q_k = round(random.uniform(5.0, 20.0), 2)
+        W_k = round(random.uniform(0.0, 15.0), 2)
 
-        model.add_node('N5', 0.0, H, 0.0)
-        model.add_node('N6', Lx, H, 0.0)
-        model.add_node('N7', Lx, H, Lz)
-        model.add_node('N8', 0.0, H, Lz)
-
-        model.add_member('C1', 'N1', 'N5', 'Steel', 'SteelSection')
-        model.add_member('C2', 'N2', 'N6', 'Steel', 'SteelSection')
-        model.add_member('C3', 'N3', 'N7', 'Steel', 'SteelSection')
-        model.add_member('C4', 'N4', 'N8', 'Steel', 'SteelSection')
-
-        model.add_member('B1', 'N5', 'N6', 'Steel', 'SteelSection')
-        model.add_member('B2', 'N6', 'N7', 'Steel', 'SteelSection')
-        model.add_member('B3', 'N7', 'N8', 'Steel', 'SteelSection')
-        model.add_member('B4', 'N8', 'N5', 'Steel', 'SteelSection')
-
-        for n in ['N1', 'N2', 'N3', 'N4']:
-            model.def_support(n, True, True, True, False, False, False)
-
-        for n in ['N5', 'N6', 'N7', 'N8']:
-            model.add_node_load(n, 'FY', -P, case='D')
-
-        for b in ['B1', 'B2', 'B3', 'B4']:
-            model.add_member_dist_load(b, 'FY', -w, -w, case='D')
-
-        model.add_load_combo('LC1', {'D': 1.0})
-        model.analyze(log=False)
-
-        beam_m_max = max(max(abs(model.members[b].max_moment('Mz', combo_tags='LC1')), abs(model.members[b].min_moment('Mz', combo_tags='LC1'))) for b in ['B1', 'B2', 'B3', 'B4'])
-        col_p_max = max(max(abs(model.members[c].max_axial('LC1')), abs(model.members[c].min_axial('LC1'))) for c in ['C1', 'C2', 'C3', 'C4'])
-        col_m_max = max(max(abs(model.members[c].max_moment('Mz', combo_tags='LC1')), abs(model.members[c].min_moment('Mz', combo_tags='LC1')), abs(model.members[c].max_moment('My', combo_tags='LC1')), abs(model.members[c].min_moment('My', combo_tags='LC1'))) for c in ['C1', 'C2', 'C3', 'C4'])
-
-        opt_beam = size_member(beam_m_max, 0.0, section_type='UB')
-        opt_col = size_member(col_m_max, col_p_max, section_type='UC')
-
-        total_weight = 4 * H * opt_col['mass'] + 2 * Lx * opt_beam['mass'] + 2 * Lz * opt_beam['mass']
+        engine = MultiStoryFEAEngine(
+            num_bays_x=n_bays_x, num_bays_z=n_bays_z, num_stories=n_stories,
+            bay_width_x=w_x, bay_width_z=w_z, story_height=h,
+            G_k=G_k, Q_k=Q_k, W_k=W_k
+        )
+        df, opt, _ = engine.build_and_analyze()
 
         dataset.append({
             'run_id': i + 1,
-            'Lx_m': Lx,
-            'Lz_m': Lz,
-            'H_m': H,
-            'dist_load_w_kNm': w,
-            'point_load_P_kN': P,
-            'beam_M_u_kNm': round(beam_m_max, 4),
-            'col_P_u_kN': round(col_p_max, 4),
-            'col_M_u_kNm': round(col_m_max, 4),
-            'optimal_beam_sec': opt_beam['name'],
-            'optimal_col_sec': opt_col['name'],
-            'beam_mass_kg_m': opt_beam['mass'],
-            'col_mass_kg_m': opt_col['mass'],
-            'beam_util_pct': opt_beam['util_pct'],
-            'col_util_pct': opt_col['util_pct'],
-            'total_steel_weight_kg': round(total_weight, 2)
+            'num_stories': n_stories, 'num_bays_x': n_bays_x, 'num_bays_z': n_bays_z,
+            'story_height': h, 'bay_width_x': w_x, 'bay_width_z': w_z,
+            'G_k': G_k, 'Q_k': Q_k, 'W_k': W_k,
+            'beam_M_u_kNm': opt['max_beam_M'],
+            'col_P_u_kN': opt['max_col_P'],
+            'optimal_beam_sec': opt['optimal_beam']['name'],
+            'optimal_col_sec': opt['optimal_col']['name'],
+            'beam_mass_kg_m': opt['optimal_beam']['mass'],
+            'col_mass_kg_m': opt['optimal_col']['mass'],
+            'total_steel_weight_kg': opt['total_weight_kg']
         })
 
-        progress_bar.progress((i + 1) / num_runs, text=f"Generating ML Training Dataset... ({i + 1}/{num_runs})")
+        progress_bar.progress((i + 1) / num_runs, text=f"Generating Multi-Story Dataset... ({i + 1}/{num_runs})")
 
     progress_bar.empty()
     df_dataset = pd.DataFrame(dataset)
@@ -487,60 +383,43 @@ def generate_dataset(num_runs=200):
     train_and_save_surrogate_model("fea_dataset.csv", "surrogate_model.pkl")
     return df_dataset
 
-def plot_3d_frame(col_height, beam_span_x, beam_span_z):
-    """Renders an interactive Plotly 3D visualization of the frame geometry."""
-    fig = go.Figure()
+# Add grid only method helper to engine
+def build_grid_only_helper(self):
+    model = self.model
+    E, G, nu, rho = 200e6, 77e6, 0.3, 78.5
+    model.add_material('Steel', E, G, nu, rho)
+    model.add_section('SteelSection', 0.01, 1e-4, 2e-4, 5e-6)
 
-    nodes = {
-        'N1': (0.0, 0.0, 0.0), 'N2': (beam_span_x, 0.0, 0.0),
-        'N3': (beam_span_x, 0.0, beam_span_z), 'N4': (0.0, 0.0, beam_span_z),
-        'N5': (0.0, col_height, 0.0), 'N6': (beam_span_x, col_height, 0.0),
-        'N7': (beam_span_x, col_height, beam_span_z), 'N8': (0.0, col_height, beam_span_z)
-    }
+    for k in range(self.num_stories + 1):
+        for i in range(self.num_bays_x + 1):
+            for j in range(self.num_bays_z + 1):
+                name = f"N_{i}_{k}_{j}"
+                model.add_node(name, i * self.bay_width_x, k * self.story_height, j * self.bay_width_z)
+                if k == 0: model.def_support(name, True, True, True, False, False, False)
 
-    members = [
-        ('C1', 'N1', 'N5'), ('C2', 'N2', 'N6'), ('C3', 'N3', 'N7'), ('C4', 'N4', 'N8'),
-        ('B1', 'N5', 'N6'), ('B2', 'N6', 'N7'), ('B3', 'N7', 'N8'), ('B4', 'N8', 'N5')
-    ]
+    for k in range(self.num_stories):
+        for i in range(self.num_bays_x + 1):
+            for j in range(self.num_bays_z + 1):
+                model.add_member(f"C_{i}_{k}_{j}", f"N_{i}_{k}_{j}", f"N_{i}_{k+1}_{j}", 'Steel', 'SteelSection')
 
-    for name, i_name, j_name in members:
-        n1 = nodes[i_name]
-        n2 = nodes[j_name]
-        color = '#38BDF8' if name.startswith('C') else '#F97316'
-        width = 7 if name.startswith('C') else 5
+    for k in range(1, self.num_stories + 1):
+        for i in range(self.num_bays_x):
+            for j in range(self.num_bays_z + 1):
+                model.add_member(f"BX_{i}_{k}_{j}", f"N_{i}_{k}_{j}", f"N_{i+1}_{k}_{j}", 'Steel', 'SteelSection')
 
-        fig.add_trace(go.Scatter3d(
-            x=[n1[0], n2[0]],
-            y=[n1[2], n2[2]],
-            z=[n1[1], n2[1]],
-            mode='lines+markers',
-            line=dict(color=color, width=width),
-            marker=dict(size=4, color='#94A3B8'),
-            name=f"Member {name}",
-            hoverinfo='text',
-            hovertext=f"Member: {name}<br>Start: {n1}<br>End: {n2}"
-        ))
+    for k in range(1, self.num_stories + 1):
+        for i in range(self.num_bays_x + 1):
+            for j in range(self.num_bays_z):
+                model.add_member(f"BZ_{i}_{k}_{j}", f"N_{i}_{k}_{j}", f"N_{i}_{k}_{j+1}", 'Steel', 'SteelSection')
 
-    fig.update_layout(
-        scene=dict(
-            xaxis_title='X Span (m)',
-            yaxis_title='Z Depth (m)',
-            zaxis_title='Y Height (m)',
-            aspectmode='data',
-            camera=dict(eye=dict(x=1.5, y=1.5, z=1.2))
-        ),
-        margin=dict(l=0, r=0, b=0, t=20),
-        height=480,
-        showlegend=False
-    )
-    return fig
+MultiStoryFEAEngine.build_grid_only = build_grid_only_helper
 
 # Streamlit App Interface Header
 st.markdown('<div class="main-header">3D BIM-to-FEA Structural Optimizer</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Automated Eurocode FEA Analysis, Speckle BIM Connector & AI Neural Surrogate Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Enterprise Eurocode FEA Engine, Multi-Story Multi-Bay Optimization & AI Neural Surrogate</div>', unsafe_allow_html=True)
 
 # Main App Navigation Tabs
-tab_fea, tab_speckle = st.tabs(["🖥️ Interactive Frame Optimizer & AI Engine", "🔗 Speckle BIM Stream Import"])
+tab_fea, tab_speckle = st.tabs(["🖥️ Enterprise Multi-Story Optimizer & AI Engine", "🔗 Speckle BIM Cloud Import"])
 
 # SIDEBAR CONTROLS
 st.sidebar.header("⚡ Engine Selector")
@@ -551,20 +430,29 @@ engine_mode = st.sidebar.radio(
 
 st.sidebar.divider()
 
-st.sidebar.header("⚙️ Frame Parameters")
+# ENTERPRISE MULTI-STORY SIDEBAR INPUTS
+st.sidebar.header("🏗️ Structural Grid Parameters")
 
-col_height = st.sidebar.slider("Column Height (m)", min_value=2.0, max_value=6.0, value=float(st.session_state['col_height']), step=0.1)
-beam_span_x = st.sidebar.slider("Beam Span X (m)", min_value=3.0, max_value=10.0, value=float(st.session_state['beam_span_x']), step=0.5)
-beam_span_z = st.sidebar.slider("Beam Span Z (m)", min_value=3.0, max_value=10.0, value=float(st.session_state['beam_span_z']), step=0.5)
+num_stories = st.sidebar.slider("Number of Stories", min_value=1, max_value=5, value=int(st.session_state['num_stories']), step=1)
+num_bays_x = st.sidebar.slider("Number of Bays (X Axis)", min_value=1, max_value=3, value=int(st.session_state['num_bays_x']), step=1)
+num_bays_z = st.sidebar.slider("Number of Bays (Z Axis)", min_value=1, max_value=3, value=int(st.session_state['num_bays_z']), step=1)
+
+story_height = st.sidebar.slider("Story Height (m)", min_value=2.5, max_value=5.0, value=float(st.session_state['story_height']), step=0.1)
+bay_width_x = st.sidebar.slider("Bay Width X (m)", min_value=3.0, max_value=10.0, value=float(st.session_state['bay_width_x']), step=0.5)
+bay_width_z = st.sidebar.slider("Bay Width Z (m)", min_value=3.0, max_value=10.0, value=float(st.session_state['bay_width_z']), step=0.5)
 
 # Keep session state updated
-st.session_state['col_height'] = col_height
-st.session_state['beam_span_x'] = beam_span_x
-st.session_state['beam_span_z'] = beam_span_z
+st.session_state['num_stories'] = num_stories
+st.session_state['num_bays_x'] = num_bays_x
+st.session_state['num_bays_z'] = num_bays_z
+st.session_state['story_height'] = story_height
+st.session_state['bay_width_x'] = bay_width_x
+st.session_state['bay_width_z'] = bay_width_z
 
-st.sidebar.subheader("📌 Loading Options")
-point_load = st.sidebar.number_input("Top Nodes Downward Point Load (kN)", min_value=0.0, max_value=500.0, value=50.0, step=5.0)
-dist_load = st.sidebar.number_input("Floor Beams Downward Uniform Load (kN/m)", min_value=0.0, max_value=100.0, value=15.0, step=1.0)
+st.sidebar.subheader("📌 Eurocode Load Parameters")
+G_k = st.sidebar.number_input("Floor Beams Dead Load G_k (kN/m)", min_value=0.0, max_value=50.0, value=15.0, step=1.0)
+Q_k = st.sidebar.number_input("Floor Beams Live Load Q_k (kN/m)", min_value=0.0, max_value=50.0, value=10.0, step=1.0)
+W_k = st.sidebar.slider("Lateral Wind Load W_k (kN/m)", min_value=0.0, max_value=20.0, value=5.0, step=0.5)
 
 st.sidebar.subheader("🛡️ Steel Grade")
 fy_grade = st.sidebar.selectbox("Steel Grade (f_y)", options=[275, 355], format_func=lambda x: f"S{x} (f_y = {x} MPa)")
@@ -575,18 +463,24 @@ st.sidebar.subheader("🤖 Machine Learning Pipeline")
 generate_ds_btn = st.sidebar.button("⚡ Generate ML Dataset (200 Runs) & Retrain AI", type="secondary", use_container_width=True)
 
 if generate_ds_btn:
-    st.sidebar.info("Running 200 PyNite FEA structural simulations and training RandomForest models...")
+    st.sidebar.info("Running 200 Multi-Story FEA simulations and training RandomForest models...")
     df_gen = generate_dataset(200)
-    st.sidebar.success("✅ Dataset generated & AI Surrogate re-trained successfully!")
+    st.sidebar.success("✅ Multi-Story Dataset generated & AI Surrogate re-trained!")
 
-# TAB 1: INTERACTIVE OPTIMIZER & AI ENGINE
+# TAB 1: INTERACTIVE MULTI-STORY OPTIMIZER & AI ENGINE
 with tab_fea:
     model_instance = None
     if "PyNite FEA" in engine_mode:
-        run_button = st.button("🚀 Run PyNite Matrix Analysis & Sizing", type="primary", use_container_width=True)
+        run_button = st.button("🚀 Run PyNite Multi-Story Solver & Section Sizing", type="primary", use_container_width=True)
 
         if run_button or 'df_results' not in st.session_state or st.session_state.get('last_mode') != 'FEA':
-            df_results, opt_summary, model_instance = build_and_analyze_model(col_height, beam_span_x, beam_span_z, point_load, dist_load, fy_grade)
+            engine = MultiStoryFEAEngine(
+                num_bays_x=num_bays_x, num_bays_z=num_bays_z, num_stories=num_stories,
+                bay_width_x=bay_width_x, bay_width_z=bay_width_z, story_height=story_height,
+                G_k=G_k, Q_k=Q_k, W_k=W_k, fy_MPa=fy_grade
+            )
+            df_results, opt_summary, model_instance = engine.build_and_analyze()
+
             st.session_state['df_results'] = df_results
             st.session_state['opt_summary'] = opt_summary
             st.session_state['model_instance'] = model_instance
@@ -597,29 +491,33 @@ with tab_fea:
             model_instance = st.session_state.get('model_instance')
 
     else:
-        st.markdown('<div class="ai-badge">⚡ Instant AI Prediction (< 10ms) &nbsp;|&nbsp; Engine: RandomForest Neural Surrogate &nbsp;|&nbsp; R² Score: 0.947</div>', unsafe_allow_html=True)
-        df_results, opt_summary, latency_ms = predict_ai_surrogate(col_height, beam_span_x, beam_span_z, point_load, dist_load, fy_grade)
-        st.caption(f"⚡ *Inference speed: {latency_ms:.2f} milliseconds (Bypassed PyNite global stiffness matrix assembly & iterative solver)*")
+        st.markdown('<div class="ai-badge">⚡ Instant AI Prediction (< 10ms) &nbsp;|&nbsp; Engine: Multi-Story Neural Surrogate &nbsp;|&nbsp; R² Score: 0.947</div>', unsafe_allow_html=True)
+        df_results, opt_summary, model_instance, latency_ms = predict_ai_surrogate(
+            num_stories, num_bays_x, num_bays_z, story_height, bay_width_x, bay_width_z, G_k, Q_k, W_k, fy_grade
+        )
+        st.caption(f"⚡ *Inference speed: {latency_ms:.2f} milliseconds (Bypassed global stiffness matrix assembly & iterative solver)*")
 
-    # Top Raw Force Metrics
+    # Top Raw Force & Grid Metrics
     max_moment_val = df_results['Max Envelope M_u (kN*m)'].max()
     critical_moment_member = df_results.loc[df_results['Max Envelope M_u (kN*m)'].idxmax()]['Member']
 
     max_axial_val = df_results['Axial Force P_u (kN)'].max()
     critical_axial_member = df_results.loc[df_results['Axial Force P_u (kN)'].idxmax()]['Member']
 
-    mcol1, mcol2, mcol3 = st.columns(3)
+    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
     with mcol1:
         st.metric(label="Max Bending Moment (M_u)", value=f"{max_moment_val:.2f} kN*m", delta=f"Critical: {critical_moment_member}")
     with mcol2:
         st.metric(label="Max Axial Compression (P_u)", value=f"{max_axial_val:.2f} kN", delta=f"Critical: {critical_axial_member}")
     with mcol3:
-        st.metric(label="Total Frame Load (FY)", value=f"{(4 * point_load + 2 * (beam_span_x + beam_span_z) * dist_load):.1f} kN")
+        st.metric(label="Structural Grid Nodes", value=f"{opt_summary['total_nodes'] if 'total_nodes' in opt_summary else len(df_results)}")
+    with mcol4:
+        st.metric(label="Structural Grid Members", value=f"{opt_summary['total_members'] if 'total_members' in opt_summary else len(df_results)}")
 
     st.divider()
 
     # OPTIMAL STEEL SECTIONS ROW
-    st.subheader("🎯 Eurocode Optimal Section Sizing & Weight Optimization")
+    st.subheader("🎯 Eurocode 3 Optimal Section Sizing & Weight Optimization")
 
     opt_beam = opt_summary['optimal_beam']
     opt_col = opt_summary['optimal_col']
@@ -649,32 +547,44 @@ with tab_fea:
             <div class="opt-card">
                 <div class="opt-title">Total Frame Steel Weight</div>
                 <div class="opt-val">{opt_summary['total_weight_kg']:.1f} kg</div>
-                <div class="opt-sub">Structural Efficiency: Optimal</div>
+                <div class="opt-sub">Structural Efficiency: Eurocode Compliant</div>
             </div>
         """, unsafe_allow_html=True)
 
     st.write("")
 
-    # Layout: 3D Visualization and Member Forces Table
-    left_col, right_col = st.columns([1, 1])
+    # Layout: 3D Visualization Heatmap and Member Forces Table
+    left_col, right_col = st.columns([1.1, 1])
 
     with left_col:
-        st.subheader("🧊 3D Structural Frame Visualization")
-        fig_3d = plot_3d_frame(col_height, beam_span_x, beam_span_z)
+        st.subheader("🧊 Multi-Story 3D Structural Grid Stress Heatmap")
+        
+        # Color Legend Banner
+        st.markdown("""
+            <div class="legend-box">
+                <span style="font-weight:700; color:#94A3B8;">Stress Heatmap:</span>
+                <span style="color:#10B981; font-weight:600;">🟢 Green (&lt;70% Safe)</span>
+                <span style="color:#F59E0B; font-weight:600;">🟡 Yellow (70-100% Optimal)</span>
+                <span style="color:#EF4444; font-weight:600;">🔴 Red (&gt;100% Overstressed)</span>
+            </div>
+        """, unsafe_allow_html=True)
+
+        fig_3d = plot_3d_frame(model_instance, df_results)
         st.plotly_chart(fig_3d, use_container_width=True)
 
     with right_col:
-        st.subheader("📊 Member Internal Forces Table")
+        st.subheader("📊 Member Internal Forces & Status Table")
         st.dataframe(
             df_results.style.format({
                 "Length (m)": "{:.2f}",
                 "Axial Force P_u (kN)": "{:.2f}",
                 "Max Bending M_z (kN*m)": "{:.2f}",
                 "Max Bending M_y (kN*m)": "{:.2f}",
-                "Max Envelope M_u (kN*m)": "{:.2f}"
+                "Max Envelope M_u (kN*m)": "{:.2f}",
+                "Util (%)": "{:.1f}"
             }).highlight_max(subset=["Max Envelope M_u (kN*m)", "Axial Force P_u (kN)"], color="#7F1D1D"),
             use_container_width=True,
-            height=430
+            height=490
         )
 
     # INTERACTIVE BMD / SFD / AFD FORCE DIAGRAMS SECTION
@@ -683,23 +593,19 @@ with tab_fea:
 
     dcol1, dcol2 = st.columns([1, 2])
     with dcol1:
+        member_options = df_results['Member'].tolist() if df_results is not None else ['C_0_0_0', 'BX_0_1_0']
         selected_member = st.selectbox(
-            "Select Member for Detailed Force Diagram Analysis:",
-            options=['B1', 'B2', 'B3', 'B4', 'C1', 'C2', 'C3', 'C4'],
+            "Select Member for Force Diagrams:",
+            options=member_options,
             index=0,
-            help="Choose any beam or column to inspect its Bending Moment (BMD), Shear Force (SFD), and Axial Force (AFD) profiles."
+            help="Select any multi-story column or floor beam to inspect its Bending Moment (BMD), Shear Force (SFD), and Axial Force (AFD) profiles."
         )
 
     with st.expander(f"🔍 View Interactive BMD, SFD & AFD Diagrams for Member {selected_member}", expanded=True):
         fig_diagrams = plot_member_diagrams(
             model=model_instance,
             member_name=selected_member,
-            combo_name='LC1',
-            col_height=col_height,
-            beam_span_x=beam_span_x,
-            beam_span_z=beam_span_z,
-            dist_load=dist_load,
-            point_load=point_load
+            combo_name='LC_ULS1'
         )
         if fig_diagrams:
             st.plotly_chart(fig_diagrams, use_container_width=True)
@@ -710,10 +616,10 @@ with tab_fea:
         st.subheader("📂 Generated ML Training Dataset (`fea_dataset.csv`)")
         df_ds = pd.read_csv("fea_dataset.csv")
         
-        dcol1, dcol2 = st.columns([3, 1])
-        with dcol1:
-            st.write(f"Dataset contains **{len(df_ds)} runs** across randomized span lengths ($4\text{{m}}–10\text{{m}}$) and loads ($10–50\text{{ kN/m}}$).")
-        with dcol2:
+        col_ds1, col_ds2 = st.columns([3, 1])
+        with col_ds1:
+            st.write(f"Dataset contains **{len(df_ds)} multi-story simulation runs** across randomized grid configurations.")
+        with col_ds2:
             csv_bytes = df_ds.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download fea_dataset.csv",
@@ -753,7 +659,7 @@ with tab_speckle:
                 
                 sc1, sc2, sc3 = st.columns(3)
                 with sc1:
-                    st.metric("Extracted Column Height (H)", f"{res['col_height']} m")
+                    st.metric("Extracted Story Height (H)", f"{res['col_height']} m")
                 with sc2:
                     st.metric("Extracted Beam Span X (L_x)", f"{res['beam_span_x']} m")
                 with sc3:
@@ -768,10 +674,10 @@ with tab_speckle:
                     </div>
                 """, unsafe_allow_html=True)
 
-                if st.button("🚀 Apply Extracted BIM Parameters to Frame Model"):
-                    st.session_state['col_height'] = float(res['col_height'])
-                    st.session_state['beam_span_x'] = float(res['beam_span_x'])
-                    st.session_state['beam_span_z'] = float(res['beam_span_z'])
-                    st.success("Updated FEA model parameters! Switch to the 'Interactive Frame Optimizer' tab to view results.")
+                if st.button("🚀 Apply Extracted BIM Parameters to Multi-Story Model"):
+                    st.session_state['story_height'] = float(res['col_height'])
+                    st.session_state['bay_width_x'] = float(res['beam_span_x'])
+                    st.session_state['bay_width_z'] = float(res['beam_span_z'])
+                    st.success("Updated FEA model parameters! Switch to the 'Enterprise Multi-Story Optimizer' tab to view results.")
             else:
                 st.error(res["error"])

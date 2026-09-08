@@ -1,12 +1,9 @@
 """
 Database of Standard UK/European Structural Steel Sections (UB and UC)
-Properties include:
-- mass: Mass per meter (kg/m)
-- A: Cross-sectional Area (cm^2)
-- W_pl_y: Plastic Section Modulus strong axis (cm^3)
-- I_y: Second moment of area strong axis (cm^4)
-- I_z: Second moment of area weak axis (cm^4)
+Includes Eurocode 3 (EN 1993-1-1) Flexural Buckling Checks and SLS Deflection Verification.
 """
+
+import math
 
 STEEL_SECTIONS = [
     # Universal Columns (UC)
@@ -30,47 +27,92 @@ STEEL_SECTIONS = [
     {"name": "UB 610x229x101", "type": "UB", "mass": 101.2, "A": 129.0, "W_pl_y": 2880.0, "I_y": 75700.0, "I_z": 2770.0},
 ]
 
-def size_member(M_u_kNm: float, P_u_kN: float, yield_strength_MPa: float = 275.0, section_type: str = None):
+def calc_ec3_buckling_resistance(A_cm2: float, Iy_cm4: float, Iz_cm4: float, L_m: float, fy_MPa: float = 275.0, E_GPa: float = 200.0):
     """
-    Finds the lightest compliant section where:
-    - Moment capacity utilization M_u / M_Rd <= 1.0
-    - Axial capacity utilization P_u / N_Rd <= 1.0
-    - Combined interaction P_u / N_Rd + M_u / M_Rd <= 1.0
+    Calculates Eurocode 3 (EN 1993-1-1 §6.3.1.2) flexural buckling resistance N_b_Rd (kN)
+    and reduction factor chi.
+    """
+    A = A_cm2 * 1.0e-4          # m^2
+    Iy = Iy_cm4 * 1.0e-8        # m^4
+    Iz = Iz_cm4 * 1.0e-8        # m^4
+    fy = fy_MPa * 1.0e6         # N/m^2
+    E = E_GPa * 1.0e9           # N/m^2
 
-    Parameters:
-    - M_u_kNm: Ultimate Bending Moment (kN*m)
-    - P_u_kN: Ultimate Axial Force (kN)
-    - yield_strength_MPa: Yield strength f_y (MPa), default 275 (S275 steel)
-    - section_type: Optional filter 'UB' or 'UC'
+    iy = math.sqrt(Iy / A)
+    iz = math.sqrt(Iz / A)
+
+    eps = math.sqrt(235.0 / fy_MPa)
+    lambda_1 = 93.9 * eps
+
+    lambda_bar_y = (L_m / iy) / lambda_1
+    lambda_bar_z = (L_m / iz) / lambda_1
+
+    # Imperfection factors: Curve b (alpha=0.34) strong axis, Curve c (alpha=0.49) weak axis
+    alpha_y, alpha_z = 0.34, 0.49
+
+    phi_y = 0.5 * (1.0 + alpha_y * (lambda_bar_y - 0.2) + lambda_bar_y**2)
+    phi_z = 0.5 * (1.0 + alpha_z * (lambda_bar_z - 0.2) + lambda_bar_z**2)
+
+    chi_y = min(1.0, 1.0 / (phi_y + math.sqrt(max(0.0001, phi_y**2 - lambda_bar_y**2))))
+    chi_z = min(1.0, 1.0 / (phi_z + math.sqrt(max(0.0001, phi_z**2 - lambda_bar_z**2))))
+
+    chi = min(chi_y, chi_z)
+    N_b_Rd_kN = (chi * A * fy) / 1000.0
+    return round(N_b_Rd_kN, 2), round(chi, 4)
+
+def calc_sls_deflection(w_kNm: float, L_m: float, Iy_cm4: float, E_GPa: float = 200.0):
+    """
+    Calculates max SLS midspan deflection delta_max (mm) for a beam under uniform load w
+    and compares against Eurocode limit delta_lim = L / 360 (mm).
+    """
+    w_Nm = abs(w_kNm) * 1000.0
+    Iy = Iy_cm4 * 1.0e-8
+    E = E_GPa * 1.0e9
+
+    delta_max_m = (5.0 * w_Nm * (L_m**4)) / (384.0 * E * Iy)
+    delta_max_mm = delta_max_m * 1000.0
+
+    delta_lim_mm = (L_m * 1000.0) / 360.0
+    util_def = delta_max_mm / delta_lim_mm if delta_lim_mm > 0 else 0.0
+
+    return round(delta_max_mm, 2), round(delta_lim_mm, 2), round(util_def, 4)
+
+def size_member(M_u_kNm: float, P_u_kN: float, L_m: float = 3.5, w_kNm: float = 0.0, yield_strength_MPa: float = 275.0, section_type: str = None):
+    """
+    Finds the lightest compliant Eurocode 3 section where:
+    - Cross-section moment capacity utilization M_u / M_Rd <= 1.0
+    - Axial compression capacity utilization P_u / N_Rd <= 1.0
+    - Flexural Column Buckling utilization P_u / N_b_Rd <= 1.0
+    - SLS Deflection utilization delta_max / (L/360) <= 1.0
+    - Combined interaction P_u / N_b_Rd + M_u / M_Rd <= 1.0
 
     Returns:
-    - Dict with optimal section details, capacities M_Rd, N_Rd, and utilization ratio
+    - Dict with optimal section details, capacities, buckling resistance, and utilization percentage.
     """
     M_u = abs(M_u_kNm)
     P_u = abs(P_u_kN)
     f_y = float(yield_strength_MPa)
 
-    # Filter candidate list
     candidates = STEEL_SECTIONS
     if section_type:
         candidates = [s for s in candidates if s["type"].upper() == section_type.upper()]
 
-    # Sort by mass ascending (lightest first)
     candidates = sorted(candidates, key=lambda x: x["mass"])
 
     for sec in candidates:
-        # Capacities:
-        # M_Rd (kN*m) = W_pl_y (cm^3) * 10^-6 m^3 * (f_y * 10^3 kN/m^2) = W_pl_y * f_y * 10^-3
         M_Rd = sec["W_pl_y"] * f_y * 1.0e-3
-
-        # N_Rd (kN) = A (cm^2) * 10^-4 m^2 * (f_y * 10^3 kN/m^2) = A * f_y * 10^-1
         N_Rd = sec["A"] * f_y * 1.0e-1
+
+        N_b_Rd, chi = calc_ec3_buckling_resistance(sec["A"], sec["I_y"], sec["I_z"], L_m, f_y)
+        delta_max_mm, delta_lim_mm, util_def = calc_sls_deflection(w_kNm, L_m, sec["I_y"])
 
         util_M = M_u / M_Rd if M_Rd > 0 else 999.0
         util_N = P_u / N_Rd if N_Rd > 0 else 999.0
-        util_comb = util_M + util_N
+        util_buck = P_u / N_b_Rd if N_b_Rd > 0 else 999.0
 
-        if util_M <= 1.0 and util_N <= 1.0 and util_comb <= 1.0:
+        util_comb = max(util_M + util_buck, util_def)
+
+        if util_M <= 1.0 and util_N <= 1.0 and util_buck <= 1.0 and util_def <= 1.0 and util_comb <= 1.0:
             return {
                 "name": sec["name"],
                 "type": sec["type"],
@@ -79,17 +121,26 @@ def size_member(M_u_kNm: float, P_u_kN: float, yield_strength_MPa: float = 275.0
                 "W_pl_y_cm3": sec["W_pl_y"],
                 "M_Rd_kNm": round(M_Rd, 2),
                 "N_Rd_kN": round(N_Rd, 2),
+                "N_b_Rd_kN": round(N_b_Rd, 2),
+                "chi_buckling": round(chi, 4),
+                "delta_max_mm": round(delta_max_mm, 2),
+                "delta_lim_mm": round(delta_lim_mm, 2),
                 "util_M": round(util_M, 4),
                 "util_N": round(util_N, 4),
+                "util_buck": round(util_buck, 4),
+                "util_def": round(util_def, 4),
                 "util_comb": round(util_comb, 4),
                 "util_pct": round(util_comb * 100, 2)
             }
 
-    # If no section is large enough in the subset, return largest available
+    # Fallback to largest section
     largest = candidates[-1]
     M_Rd = largest["W_pl_y"] * f_y * 1.0e-3
     N_Rd = largest["A"] * f_y * 1.0e-1
-    util_comb = (M_u / M_Rd) + (P_u / N_Rd)
+    N_b_Rd, chi = calc_ec3_buckling_resistance(largest["A"], largest["I_y"], largest["I_z"], L_m, f_y)
+    delta_max_mm, delta_lim_mm, util_def = calc_sls_deflection(w_kNm, L_m, largest["I_y"])
+    util_comb = max((M_u / M_Rd) + (P_u / N_b_Rd), util_def)
+
     return {
         "name": largest["name"],
         "type": largest["type"],
@@ -98,8 +149,14 @@ def size_member(M_u_kNm: float, P_u_kN: float, yield_strength_MPa: float = 275.0
         "W_pl_y_cm3": largest["W_pl_y"],
         "M_Rd_kNm": round(M_Rd, 2),
         "N_Rd_kN": round(N_Rd, 2),
+        "N_b_Rd_kN": round(N_b_Rd, 2),
+        "chi_buckling": round(chi, 4),
+        "delta_max_mm": round(delta_max_mm, 2),
+        "delta_lim_mm": round(delta_lim_mm, 2),
         "util_M": round(M_u / M_Rd, 4),
         "util_N": round(P_u / N_Rd, 4),
+        "util_buck": round(P_u / N_b_Rd, 4),
+        "util_def": round(util_def, 4),
         "util_comb": round(util_comb, 4),
         "util_pct": round(util_comb * 100, 2)
     }

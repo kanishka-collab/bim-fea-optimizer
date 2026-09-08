@@ -1,117 +1,232 @@
+"""
+Enterprise Multi-Story Multi-Bay Structural FEA Engine (PyNite FEA Kernel)
+Supports Eurocode EN 1990/EN 1993 Load Combinations, Flexural Buckling, and SLS Deflection Sizing.
+"""
+
+import pandas as pd
 import Pynite
 from Pynite import FEModel3D
+from steel_sections import size_member, STEEL_SECTIONS
+
+class MultiStoryFEAEngine:
+    def __init__(
+        self,
+        num_bays_x: int = 1,
+        num_bays_z: int = 1,
+        num_stories: int = 1,
+        bay_width_x: float = 6.0,
+        bay_width_z: float = 6.0,
+        story_height: float = 3.5,
+        G_k: float = 15.0,    # Dead Load (kN/m)
+        Q_k: float = 10.0,    # Live Load (kN/m)
+        W_k: float = 5.0,     # Wind Load (kN/m)
+        fy_MPa: float = 275.0
+    ):
+        self.num_bays_x = int(max(1, num_bays_x))
+        self.num_bays_z = int(max(1, num_bays_z))
+        self.num_stories = int(max(1, num_stories))
+        self.bay_width_x = float(bay_width_x)
+        self.bay_width_z = float(bay_width_z)
+        self.story_height = float(story_height)
+        self.G_k = float(G_k)
+        self.Q_k = float(Q_k)
+        self.W_k = float(W_k)
+        self.fy_MPa = float(fy_MPa)
+
+        self.model = FEModel3D()
+        self.df_results = None
+        self.opt_summary = None
+
+    def build_and_analyze(self):
+        """Builds multi-story structural grid model, applies Eurocode load combinations, and solves."""
+        model = self.model
+
+        # 1. Define Material & Default Section
+        E = 200e6    # kN/m^2 (200 GPa)
+        G = 77e6     # kN/m^2 (77 GPa)
+        nu = 0.3
+        rho = 78.5   # kN/m^3
+        model.add_material('Steel', E, G, nu, rho)
+
+        A = 0.01      # m^2
+        Iz = 2.0e-4   # m^4
+        Iy = 1.0e-4   # m^4
+        J = 5.0e-6    # m^4
+        model.add_section('SteelSection', A, Iy, Iz, J)
+
+        # 2. Build 3D Node Grid
+        for k in range(self.num_stories + 1):
+            for i in range(self.num_bays_x + 1):
+                for j in range(self.num_bays_z + 1):
+                    node_name = f"N_{i}_{k}_{j}"
+                    x_pos = i * self.bay_width_x
+                    y_pos = k * self.story_height
+                    z_pos = j * self.bay_width_z
+                    model.add_node(node_name, x_pos, y_pos, z_pos)
+
+                    # Pinned supports at base level (k = 0)
+                    if k == 0:
+                        model.def_support(node_name, True, True, True, False, False, False)
+
+        # 3. Add Columns (Vertical)
+        for k in range(self.num_stories):
+            for i in range(self.num_bays_x + 1):
+                for j in range(self.num_bays_z + 1):
+                    col_name = f"C_{i}_{k}_{j}"
+                    n1 = f"N_{i}_{k}_{j}"
+                    n2 = f"N_{i}_{k+1}_{j}"
+                    model.add_member(col_name, n1, n2, 'Steel', 'SteelSection')
+
+        # 4. Add Beams X (Horizontal X-Direction)
+        for k in range(1, self.num_stories + 1):
+            for i in range(self.num_bays_x):
+                for j in range(self.num_bays_z + 1):
+                    beam_name = f"BX_{i}_{k}_{j}"
+                    n1 = f"N_{i}_{k}_{j}"
+                    n2 = f"N_{i+1}_{k}_{j}"
+                    model.add_member(beam_name, n1, n2, 'Steel', 'SteelSection')
+
+        # 5. Add Beams Z (Horizontal Z-Direction)
+        for k in range(1, self.num_stories + 1):
+            for i in range(self.num_bays_x + 1):
+                for j in range(self.num_bays_z):
+                    beam_name = f"BZ_{i}_{k}_{j}"
+                    n1 = f"N_{i}_{k}_{j}"
+                    n2 = f"N_{i}_{k}_{j+1}"
+                    model.add_member(beam_name, n1, n2, 'Steel', 'SteelSection')
+
+        # 6. Apply Distributed Loads
+        # Floor Beams (Dead G_k and Live Q_k)
+        for m_name, member in model.members.items():
+            if m_name.startswith('B'):
+                if self.G_k > 0:
+                    model.add_member_dist_load(m_name, 'FY', -abs(self.G_k), -abs(self.G_k), case='G')
+                if self.Q_k > 0:
+                    model.add_member_dist_load(m_name, 'FY', -abs(self.Q_k), -abs(self.Q_k), case='Q')
+
+        # Windward Columns (Wind W_k in X-Direction at i = 0)
+        if self.W_k > 0:
+            for k in range(self.num_stories):
+                for j in range(self.num_bays_z + 1):
+                    col_name = f"C_0_{k}_{j}"
+                    if col_name in model.members:
+                        model.add_member_dist_load(col_name, 'FX', abs(self.W_k), abs(self.W_k), case='W')
+
+        # 7. Add Eurocode Load Combinations
+        model.add_load_combo('LC_ULS1', {'G': 1.35, 'Q': 1.50, 'W': 0.90})
+        model.add_load_combo('LC_ULS2', {'G': 1.00, 'Q': 1.05, 'W': 1.50})
+        model.add_load_combo('LC_SLS', {'G': 1.00, 'Q': 1.00, 'W': 1.00})
+
+        # 8. Execute Solver
+        model.analyze(log=False)
+
+        # 9. Extract Member Forces & Optimal Eurocode 3 Sizing
+        results = []
+        max_beam_M = 0.0
+        max_col_P = 0.0
+        max_col_M = 0.0
+
+        for name, member in model.members.items():
+            mtype = "Column" if name.startswith('C') else "Beam"
+            L_m = member.L()
+
+            # Envelope across ULS combinations
+            p_uls1 = max(abs(member.max_axial('LC_ULS1')), abs(member.min_axial('LC_ULS1')))
+            p_uls2 = max(abs(member.max_axial('LC_ULS2')), abs(member.min_axial('LC_ULS2')))
+            max_p = max(p_uls1, p_uls2)
+
+            mz_uls1 = max(abs(member.max_moment('Mz', combo_tags='LC_ULS1')), abs(member.min_moment('Mz', combo_tags='LC_ULS1')))
+            mz_uls2 = max(abs(member.max_moment('Mz', combo_tags='LC_ULS2')), abs(member.min_moment('Mz', combo_tags='LC_ULS2')))
+            max_mz = max(mz_uls1, mz_uls2)
+
+            my_uls1 = max(abs(member.max_moment('My', combo_tags='LC_ULS1')), abs(member.min_moment('My', combo_tags='LC_ULS1')))
+            my_uls2 = max(abs(member.max_moment('My', combo_tags='LC_ULS2')), abs(member.min_moment('My', combo_tags='LC_ULS2')))
+            max_my = max(my_uls1, my_uls2)
+
+            max_m = max(max_mz, max_my)
+
+            if mtype == "Beam":
+                if max_m > max_beam_M:
+                    max_beam_M = max_m
+            else:
+                if max_p > max_col_P:
+                    max_col_P = max_p
+                if max_m > max_col_M:
+                    max_col_M = max_m
+
+            # Perform section sizing
+            sec_type = 'UC' if mtype == 'Column' else 'UB'
+            total_load_w = self.G_k + self.Q_k if mtype == 'Beam' else 0.0
+            opt_sec = size_member(max_m, max_p, L_m=L_m, w_kNm=total_load_w, yield_strength_MPa=self.fy_MPa, section_type=sec_type)
+
+            util_pct = opt_sec['util_pct']
+            status_color = "Green" if util_pct < 70.0 else ("Yellow" if util_pct <= 100.0 else "Red")
+
+            results.append({
+                "Member": name,
+                "Type": mtype,
+                "Length (m)": round(L_m, 2),
+                "Axial Force P_u (kN)": round(max_p, 2),
+                "Max Bending M_z (kN*m)": round(max_mz, 2),
+                "Max Bending M_y (kN*m)": round(max_my, 2),
+                "Max Envelope M_u (kN*m)": round(max_m, 2),
+                "Assigned Section": opt_sec['name'],
+                "Mass (kg/m)": opt_sec['mass'],
+                "Util (%)": util_pct,
+                "Status": status_color
+            })
+
+        df_results = pd.DataFrame(results)
+
+        # Global optimal sections
+        total_w_kNm = self.G_k + self.Q_k
+        optimal_beam = size_member(max_beam_M, 0.0, L_m=self.bay_width_x, w_kNm=total_w_kNm, yield_strength_MPa=self.fy_MPa, section_type='UB')
+        optimal_col = size_member(max_col_M, max_col_P, L_m=self.story_height, yield_strength_MPa=self.fy_MPa, section_type='UC')
+
+        # Total Weight calculation
+        total_col_length = (self.num_bays_x + 1) * (self.num_bays_z + 1) * self.num_stories * self.story_height
+        total_beam_x_length = self.num_bays_x * (self.num_bays_z + 1) * self.num_stories * self.bay_width_x
+        total_beam_z_length = (self.num_bays_x + 1) * self.num_bays_z * self.num_stories * self.bay_width_z
+
+        total_weight_kg = (total_col_length * optimal_col['mass']) + ((total_beam_x_length + total_beam_z_length) * optimal_beam['mass'])
+
+        self.df_results = df_results
+        self.opt_summary = {
+            "optimal_beam": optimal_beam,
+            "optimal_col": optimal_col,
+            "total_weight_kg": round(total_weight_kg, 2),
+            "max_beam_M": round(max_beam_M, 2),
+            "max_col_P": round(max_col_P, 2),
+            "total_nodes": len(model.nodes),
+            "total_members": len(model.members)
+        }
+
+        return df_results, self.opt_summary, model
 
 def main():
-    # 1. Initialize 3D FEA Model
-    model = FEModel3D()
+    print("Executing Enterprise MultiStoryFEAEngine Test...")
+    engine = MultiStoryFEAEngine(
+        num_bays_x=2,
+        num_bays_z=1,
+        num_stories=2,
+        bay_width_x=6.0,
+        bay_width_z=5.0,
+        story_height=3.5,
+        G_k=15.0,
+        Q_k=10.0,
+        W_k=5.0
+    )
+    df, opt, model = engine.build_and_analyze()
 
-    # 2. Define Material (Steel: E = 200 GPa = 200e6 kN/m^2, G = 77 GPa = 77e6 kN/m^2, nu = 0.3, rho = 78.5 kN/m^3)
-    E = 200e6    # kN/m^2
-    G = 77e6     # kN/m^2
-    nu = 0.3
-    rho = 78.5   # kN/m^3
-    model.add_material('Steel', E, G, nu, rho)
-
-    # 3. Define Section Properties (SI units: m^2 and m^4)
-    A = 0.01      # Cross-sectional Area (m^2)
-    Iz = 2.0e-4   # Strong axis Moment of Inertia (m^4)
-    Iy = 1.0e-4   # Weak axis Moment of Inertia (m^4)
-    J = 5.0e-6    # Torsional constant (m^4)
-    model.add_section('SteelSection', A, Iy, Iz, J)
-
-    # 4. Define Nodes for 3D Portal Frame
-    # 4 Base nodes (Y = 0.0 m)
-    model.add_node('N1', 0.0, 0.0, 0.0)
-    model.add_node('N2', 6.0, 0.0, 0.0)
-    model.add_node('N3', 6.0, 0.0, 6.0)
-    model.add_node('N4', 0.0, 0.0, 6.0)
-
-    # 4 Top nodes (Y = 3.5 m)
-    model.add_node('N5', 0.0, 3.5, 0.0)
-    model.add_node('N6', 6.0, 3.5, 0.0)
-    model.add_node('N7', 6.0, 3.5, 6.0)
-    model.add_node('N8', 0.0, 3.5, 6.0)
-
-    # 5. Add Members (4 Columns of 3.5m height, 4 Beams of 6.0m span)
-    # Columns
-    model.add_member('C1', 'N1', 'N5', 'Steel', 'SteelSection')
-    model.add_member('C2', 'N2', 'N6', 'Steel', 'SteelSection')
-    model.add_member('C3', 'N3', 'N7', 'Steel', 'SteelSection')
-    model.add_member('C4', 'N4', 'N8', 'Steel', 'SteelSection')
-
-    # Beams
-    model.add_member('B1', 'N5', 'N6', 'Steel', 'SteelSection')
-    model.add_member('B2', 'N6', 'N7', 'Steel', 'SteelSection')
-    model.add_member('B3', 'N7', 'N8', 'Steel', 'SteelSection')
-    model.add_member('B4', 'N8', 'N5', 'Steel', 'SteelSection')
-
-    # 6. Apply Pinned Supports at Base Nodes (Restrain DX, DY, DZ; Free RX, RY, RZ)
-    base_nodes = ['N1', 'N2', 'N3', 'N4']
-    for node in base_nodes:
-        model.def_support(node, True, True, True, False, False, False)
-
-    # 7. Apply Downwards Vertical Point Load of 50 kN on Top Nodes
-    top_nodes = ['N5', 'N6', 'N7', 'N8']
-    for node in top_nodes:
-        model.add_node_load(node, 'FY', -50.0, case='D')
-
-    # 8. Apply Downwards Distributed Load of 15 kN/m on all 4 Floor Beams (B1, B2, B3, B4)
-    floor_beams = ['B1', 'B2', 'B3', 'B4']
-    for beam in floor_beams:
-        model.add_member_dist_load(beam, 'FY', -15.0, -15.0, case='D')
-
-    # 9. Add Load Combination
-    model.add_load_combo('LC1', {'D': 1.0})
-
-    # 10. Run FEA Analysis
+    print("\n==================================================")
+    print("      ENTERPRISE MULTI-STORY STRUCTURAL FEA       ")
     print("==================================================")
-    print("       3D STRUCTURAL STEEL PORTAL FRAME FEA       ")
-    print("==================================================")
-    print("Analyzing 3D Portal Frame model with distributed beam loads...")
-    model.analyze(log=False)
-    print("Analysis complete.\n")
-
-    # 11. Summary Results
-    print("Member Results Summary (Load Combo LC1):")
-    print(f"{'Member':<8} | {'Type':<8} | {'Axial P (kN)':<14} | {'Max Mz (kN*m)':<14} | {'Max My (kN*m)':<14}")
-    print("-" * 70)
-
-    max_M_u = 0.0
-    critical_member_M = None
-    max_P_u = 0.0
-    critical_member_P = None
-
-    for name, member in model.members.items():
-        mtype = "Column" if name.startswith('C') else "Beam"
-        
-        # Axial force P
-        p_max = abs(member.max_axial('LC1'))
-        p_min = abs(member.min_axial('LC1'))
-        max_p = max(p_max, p_min)
-
-        # Bending moments
-        mz_max = abs(member.max_moment('Mz', combo_tags='LC1'))
-        mz_min = abs(member.min_moment('Mz', combo_tags='LC1'))
-        my_max = abs(member.max_moment('My', combo_tags='LC1'))
-        my_min = abs(member.min_moment('My', combo_tags='LC1'))
-
-        max_m = max(mz_max, mz_min, my_max, my_min)
-
-        print(f"{name:<8} | {mtype:<8} | {max_p:<14.4f} | {max(mz_max, mz_min):<14.4f} | {max(my_max, my_min):<14.4f}")
-
-        if max_m >= max_M_u:
-            max_M_u = max_m
-            critical_member_M = name
-
-        if max_p >= max_P_u:
-            max_P_u = max_p
-            critical_member_P = name
-
-    print("-" * 70)
-    print(f"\nUPDATED RESULTS OVERVIEW:")
-    print(f"  Maximum Bending Moment (M_u) : {max_M_u:.4f} kN*m (Critical Member: {critical_member_M})")
-    print(f"  Maximum Axial Force (P_u)    : {max_P_u:.4f} kN (Critical Member: {critical_member_P})")
-    print(f"==================================================\n")
+    print(f"Total Nodes: {opt['total_nodes']} | Total Members: {opt['total_members']}")
+    print(f"Optimal Beam Section (UB) : {opt['optimal_beam']['name']} ({opt['optimal_beam']['mass']} kg/m)")
+    print(f"Optimal Column Section (UC): {opt['optimal_col']['name']} ({opt['optimal_col']['mass']} kg/m)")
+    print(f"Total Steel Weight         : {opt['total_weight_kg']:.2f} kg")
+    print("==================================================\n")
+    print(df.head(10))
 
 if __name__ == '__main__':
     main()
