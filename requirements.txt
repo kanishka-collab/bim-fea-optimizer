@@ -1,0 +1,7 @@
+PyNiteFEA
+specklepy
+streamlit
+plotly
+pandas
+scikit-learn
+joblib
