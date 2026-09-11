@@ -20,7 +20,8 @@ surrogate_model.pkl
 enterprise_fea_dataset.csv
 test_100.csv
 
-# OS generated files
+# OS generated files & temporary artifacts
 .DS_Store
 Thumbs.db
+*.pdf
 
